@@ -416,16 +416,17 @@ function stripBasePath(baseUrl: string): string {
 function normalizeBaseUrl(baseUrl: string, api: string): string {
   const root = stripBasePath(baseUrl);
 
+  // 已经包含版本号后缀（/v1、/v4、/v1beta 等）或特殊版本路径段 → 不再追加
+  // 覆盖智谱 /api/paas/v4、Google /v1beta 等风格
+  if (/\/v\d+(?:beta)?(?:\/|$)/i.test(root)) return root;
+
   switch (api) {
     case "openai-completions":
     case "openai-responses":
     case "anthropic-messages":
-      // OpenAI/Anthropic 兼容协议要求 /v1 前缀；只在"不以 /v1 结尾"时补，
-      // 避免路径中段含 /v1/ 的历史误判
       return /\/v1$/i.test(root) ? root : `${root}/v1`;
 
     case "google-generative-ai":
-      // Google Generative AI 需要 /v1beta 或 /v1 前缀
       if (!/(\/v1|\/v1beta)(\/|$)/i.test(root)) return `${root}/v1`;
       return root;
 
@@ -562,12 +563,19 @@ async function fetchModels(
   headers?: Record<string, string>
 ): Promise<string[]> {
   const cleanBase = stripBasePath(baseUrl);
-  const v1Base = /\/v1$/i.test(cleanBase) ? cleanBase : `${cleanBase}/v1`;
+  // 已包含版本段（/v1、/v4、/api/paas/v4）则不追加 /v1
+  const hasVersion = /\/v\d+(?:beta)?(?:\/|$)/i.test(cleanBase);
+  const v1Base = hasVersion ? cleanBase : `${cleanBase}/v1`;
 
-  // 尝试多种端点路径（google / anthropic 也走标准 /models 列表端点）
+  // 尝试多种端点路径
   const endpoints = api === "google-generative-ai"
     ? [`${v1Base}/models`]
-    : [ `${v1Base}/models`, `${cleanBase}/models`, `${cleanBase}/api/models` ];
+    : [
+        `${v1Base}/models`,     // 标准 /v1/models
+        `${cleanBase}/models`,  // 已含版本或原始路径
+        `${cleanBase}/v4/models`, // 智谱 /api/paas/v4 后追加
+        `${cleanBase}/api/models`,
+      ];
 
   // 按协议组装认证头：anthropic 用 x-api-key，google 用 x-goog-api-key，其余 Bearer
   const requestHeaders: Record<string, string> = { ...resolveHeaders(headers) };
@@ -667,10 +675,11 @@ async function probeEndpoint(
   const base = url.replace(/\/+$/, "");
   const resolvedKey = apiKey ? resolveValue(apiKey) : "";
 
-  // 按常见端点路径尝试（OpenAI 兼容最多，其次 Anthropic）
+  // 按常见端点路径尝试（OpenAI 兼容最多，其次 Anthropic/Google）
   const attempts = [
     { ep: `${base}/v1/models`, api: "openai-completions" },
     { ep: `${base}/models`, api: "openai-completions" },
+    { ep: `${base}/v4/models`, api: "openai-completions" }, // 智谱风格 /api/paas/v4
     { ep: `${base}/v1/models`, api: "anthropic-messages", useXApiKey: true },
   ];
 
