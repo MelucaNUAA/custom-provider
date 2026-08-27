@@ -217,13 +217,19 @@ pi install local:/path/to/custom-provider
 
 ### 多模态（图片输入）
 
-所有模型默认 `input: ["text", "image"]`，pi 会将图片附件发送给模型。纯文本模型不受影响（用户不发图片时不触发任何副作用）。
+默认 `input: ["text"]`（纯文本）。pi 会自动识别已知的多模态模型并开启图片输入：
 
-如需某个模型只支持纯文本，通过 `--overrides` 显式设置：
+1. **OpenRouter 目录**：`architecture.input_modalities` 含 `image` 时自动标记
+2. **内置模式匹配**：`gpt-4o` / `claude-*` / `gemini-*` / `grok-4+` / `glm-4v` / `qwen-vl` / `minimax-m*` 及 ID 含 `vision` 的模型
+3. **显式覆盖**：模型对象写 `input: ["text", "image"]` 或 `["text"]`
+
+**为什么默认不开**：向不支持图片的模型发图会收到上游 404（如 deepseek-v4-flash-0731 非 vision 版）。未知模型保守处理为纯文本；已知视觉模型自动开启，无需手动配置。
+
+**强制指定**：
 
 ```bash
-/custom-provider add pure-text --base-url ... \
-    --overrides '{"mymodel":{"input":["text"]}}'
+/custom-provider add my --base-url ... \
+    --overrides '{"mymodel":{"input":["text","image"]}}'
 ```
 
 ### 上下文窗口与规格推断
