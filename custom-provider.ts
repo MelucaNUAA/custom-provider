@@ -1162,7 +1162,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       );
       if (!addMode) return;
 
-      // ================= 简单添加路径（3 步完成）=================
+      // ================= 简单添加路径（4 步完成）=================
       if (addMode.startsWith("简单")) {
         // 1. URL
         const simpleUrl = await ctx.ui.input(
@@ -1171,9 +1171,15 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         );
         if (!simpleUrl) return;
 
-        // 2. 探测
+        // 2. API Key（留空 = local 无认证）
+        const simpleKeyInput = await ctx.ui.input(
+          "API Key（留空 = 无认证本地服务，支持 $ENV 环境变量）",
+          "$DEEPSEEK_API_KEY"
+        );
+        const simpleApiKey = simpleKeyInput?.trim() || "local";
+
+        // 3. 探测
         ctx.ui.notify("正在探测端点…", "info");
-        let simpleApiKey = "local";
         const probeResult = await probeEndpoint(simpleUrl, simpleApiKey);
 
         let simpleModels: (string | IModel)[] = [];
