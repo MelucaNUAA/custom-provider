@@ -134,7 +134,7 @@ const FALLBACK_DEFAULT: { contextWindow: number; maxTokens: number } = {
 };
 
 // 远程规格表：normalize 后的模型 id -> { contextWindow, maxTokens }
-let remoteSpecStore: Map<string, { contextWindow: number; maxTokens: number; vision?: boolean }> | null = null;
+let remoteSpecStore: Map<string, { contextWindow: number; maxTokens: number }> | null = null;
 
 // 归一化候选链（借鉴 LiveAgent normalizeModelIdCandidates）：
 // 原始 id → 小写 → 去 @版本 → 去 [1m] 后缀 → 去日期段 → 去变体词 → 剥路径前缀。
@@ -179,15 +179,6 @@ function ingestRemoteModels(data: any[]): void {
     if (!ctx) continue;
     // 入库即卫生化：输出吃满窗口的退化数据钳到保守上限，避免输入预算被挤成零
     const limited = normalizeModelLimits(Number(ctx), rawOut);
-    // 原生多模态：OpenRouter architecture.input_modalities 含 image 时标记 vision
-    const vision = Array.isArray(m.architecture?.input_modalities)
-      ? m.architecture.input_modalities.includes("image")
-      : undefined;
-    const entry: { contextWindow: number; maxTokens: number; vision?: boolean } = {
-      contextWindow: limited.contextWindow,
-      maxTokens: limited.maxTokens,
-      ...(vision !== undefined ? { vision } : {}),
-    };
     const key = normalizeModelIdCandidates(m.id)[4] ?? m.id.toLowerCase(); // 去 @ 与 [1m] 后的规范形
     const prev = remoteSpecStore.get(key);
     if (
@@ -195,7 +186,7 @@ function ingestRemoteModels(data: any[]): void {
       limited.contextWindow > prev.contextWindow ||
       (limited.contextWindow === prev.contextWindow && limited.maxTokens > prev.maxTokens)
     ) {
-      remoteSpecStore.set(key, entry);
+      remoteSpecStore.set(key, limited);
     }
   }
 }
@@ -284,20 +275,6 @@ const KNOWN_SPECS: Record<string, { contextWindow: number; maxTokens: number }> 
   "mimo-v2.5": { contextWindow: 262144, maxTokens: 65536 },
   "minimax-m2": { contextWindow: 262144, maxTokens: 65536 },
 };
-
-// 已知原生多模态模型（默认 input 含 image）：按前缀/关键字匹配
-// 命中后模型 input = ["text","image"]，未命中保持 ["text"] 避免上游 404
-const VISION_MODEL_PATTERNS: RegExp[] = [
-  /vision/i,
-  /^gpt-4o$/i, /^gpt-4o-mini$/i, /^gpt-4\.1(?!-nano)/i, /^chatgpt-4o/i,
-  /^claude-(sonnet|opus|haiku)/i, /^claude-3/i, /^claude-4/i, /^claude-5/i,
-  /^gemini/i, /^grok-(2|3|4|5)/i,
-  /^glm-4v/i, /^qwen-vl/i, /^minimax-m[123]/i,
-];
-
-function isVisionModel(modelId: string): boolean {
-  return VISION_MODEL_PATTERNS.some((re) => re.test(modelId.trim()));
-}
 
 function getKnownSpec(modelId: string): { contextWindow: number; maxTokens: number } | undefined {
   const candidates = normalizeModelIdCandidates(modelId);
@@ -502,7 +479,7 @@ function prepareModel(raw: string | IModel, provider: IProvider): ProviderModelC
     id: src.id,
     name: src.name ?? src.id,
     reasoning: src.reasoning ?? false,
-    input: src.input ?? (spec?.vision ?? isVisionModel(src.id) ? ["text", "image"] : ["text"]),
+    input: src.input ?? ["text", "image"],
     contextWindow: contextWindow!,
     maxTokens: maxTokens!,
     cost: {
