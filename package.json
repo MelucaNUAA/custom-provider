@@ -1,6 +1,6 @@
 {
   "name": "custom-provider-pi",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "pi 扩展：统一管理第三方模型 Provider。子命令体系 /custom-provider add|remove|refresh|list|test|config|enable|disable|prune，支持交互向导、flags/JSON 非交互添加、双协议混用（OpenAI + Anthropic）、模型关键字过滤与修剪",
   "keywords": [
     "pi-package",

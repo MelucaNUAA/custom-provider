@@ -1084,6 +1084,58 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     }
   });
 
+  // ================= 图片随本轮用户消息透传 =================
+  // 语义：图片参数只跟随「当前这轮用户输入」——
+  //   本轮 user 消息带图 → 全部保留（含之后的工具结果图）
+  //   本轮纯文本        → 历史图片/旧工具图全部剥除（替换为占位文本），
+  //                       避免不支持图像的模型收到 image 参数而报错
+  const IMAGE_BLOCK_TYPES = new Set(["image", "image_url"]);
+  const HISTORICAL_IMAGE_PLACEHOLDER = "(historical image omitted)";
+
+  pi.on("before_provider_request", (event) => {
+    const payload: any = event.payload;
+    if (!payload || !Array.isArray(payload.messages)) return;
+    const msgs = payload.messages;
+
+    // 找最后一条 user 消息下标
+    let lastUserIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx < 0) return;
+
+    // 判断本轮用户消息是否带图（content 为数组且含 image 类块）
+    const lastUser = msgs[lastUserIdx];
+    const userContent = lastUser?.content;
+    let currentUserHasImage = false;
+    if (Array.isArray(userContent)) {
+      currentUserHasImage = userContent.some(
+        (c: any) => c && typeof c === "object" && IMAGE_BLOCK_TYPES.has(c.type)
+      );
+    }
+    if (currentUserHasImage) return; // 本轮带图：全部透传
+
+    // 本轮无图：剥除非 last-user 消息与最后 user 之后 toolResult 以外的所有图块；
+    // 实现：遍历消息，对 content 数组过滤 image 块；若某条剩余为空则填占位文本
+    for (let i = 0; i < msgs.length; i++) {
+      if (i === lastUserIdx) continue;
+      const msg = msgs[i];
+      if (!msg || !Array.isArray(msg.content)) continue;
+      const hasImg = msg.content.some(
+        (c: any) => c && typeof c === "object" && IMAGE_BLOCK_TYPES.has(c.type)
+      );
+      if (!hasImg) continue;
+      const kept = msg.content.filter(
+        (c: any) => !(c && typeof c === "object" && IMAGE_BLOCK_TYPES.has(c.type))
+      );
+      if (kept.length === 0) {
+        msg.content = [{ type: "text", text: HISTORICAL_IMAGE_PLACEHOLDER }];
+      } else {
+        msg.content = kept;
+      }
+    }
+  });
+
 // ================= 子命令实现 =================
 
   // 交互式过滤模型列表（按关键字保留/排除）；返回 null 表示保留全部
