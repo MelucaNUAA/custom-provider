@@ -36,7 +36,7 @@ const UA_PRESETS: Record<string, string> = {
 
 // 请求头模板（借鉴 LiveAgent：按客户端/CLI 预设整组请求头，而非只预设 UA）：
 // 不同客户端携带的头集合不同（Claude Code 有 x-app/anthropic-version/X-Stainless-* 等）。
-// 选模板一次性灌入；选「自定义」逐头输入。
+// 选模板一次性灌入；选"自定义"逐头输入。
 interface HeaderPreset {
   label: string;
   key?: string; // undefined = 自定义
@@ -91,8 +91,8 @@ function hasHeader(headers: Record<string, string> | undefined, name: string): b
 // ---- 远程规格查询（OpenRouter 公开目录，带磁盘缓存）----
 
 // 输出上限处置（借鉴 LiveAgent normalizeModelLimits）
-// 社区目录/中转对不公布独立输出上限的模型常给退化值「输出==窗口」，
-// 照单全收会把「窗口−输出预留」的输入预算挤成零。处理：钳到保守上限，
+// 社区目录/中转对不公布独立输出上限的模型常给退化值"输出==窗口"，
+// 照单全收会把"窗口−输出预留"的输入预算挤成零。处理：钳到保守上限，
 // 并保底留 3/4 窗口给输入。
 const MAX_OUTPUT_TOKEN_CAP = 32000;
 
@@ -1370,7 +1370,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
 
       // ---- 4. 协议类型 ----
       const apiType = await ctx.ui.select(
-        "API 协议类型（推荐「自动推断」，按 URL 自动识别）",
+        "API 协议类型（推荐"自动推断"，按 URL 自动识别）",
         ["自动推断", "openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]
       );
       if (!apiType) return;
@@ -1438,7 +1438,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         "若服务支持模型列表端点可自动获取；否则将手动输入"
       );
 
-      // ---- 6. 请求头模板（预设整组请求头，不同 CLI 头集合不同；选「自定义」逐头输入）----
+      // ---- 6. 请求头模板（预设整组请求头，不同 CLI 头集合不同；选"自定义"逐头输入）----
       const presetLabels = HEADER_PRESETS.map((p) => p.label);
       const presetChoice = await ctx.ui.select(
         "请求头模板？",
@@ -1470,9 +1470,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         const preset = HEADER_PRESETS.find((p) => p.label === presetChoice);
         if (preset?.key) {
           if (preset.key !== "browser") {
-            applyHeaderSet({ ...preset.headers }, `模板「${preset.label}」`);
+            applyHeaderSet({ ...preset.headers }, `模板"${preset.label}"`);
             ctx.ui.notify(
-              `已应用请求头模板「${preset.label}」: ${Object.keys(preset.headers).join(", ")}`,
+              `已应用请求头模板"${preset.label}": ${Object.keys(preset.headers).join(", ")}`,
               "info"
             );
           } // 浏览器模板 = 不写头，由 pi 自动补充浏览器 UA
@@ -2442,7 +2442,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     description: "管理第三方 Provider：add / remove / refresh / list / test / help",
     getArgumentCompletions: (prefix: string) => {
       // 注意: pi 会用 item.value 替换整个参数段（命令名后的全部文本），
-      // 所以 value 必须是「子命令 + 完整名称」的完整参数，label 才是用于显示的名称。
+      // 所以 value 必须是"子命令 + 完整名称"的完整参数，label 才是用于显示的名称。
       const trimmed = prefix.trim();
       const match = trimmed.match(/^(\S+)(?:\s+(.*))?$/);
       const first = (match?.[1] ?? "").toLowerCase();
