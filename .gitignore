@@ -1,5 +1,10 @@
 node_modules/
 package-lock.json
+pnpm-lock.yaml
 *.bak
 npm-debug.log*
 .DS_Store
+
+# Test files
+test-*.ts
+test-*.json

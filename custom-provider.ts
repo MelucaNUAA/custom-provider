@@ -74,8 +74,8 @@ const HEADER_PRESETS: HeaderPreset[] = [
 
 // 头名校验：HTTP token 字符集（含 ASCII 特殊符号，无空格/换行）
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-// 头值只允许可见 ASCII 与制表符：CR/LF 会造成 header 注入，非 ASCII 可能让请求出错
-const HEADER_VALUE_RE = /^[\t\x20-\x7e]*$/;
+// 头值严格校验：仅允许可见 ASCII，拒绝所有控制字符（包括制表符）防止注入
+const HEADER_VALUE_RE = /^[\x20-\x7e]*$/;
 // 设置这些头可能覆盖认证/协议逻辑：允许但给予提示
 const SENSITIVE_HEADER_HINTS = ["authorization", "x-api-key", "x-goog-api-key", "anthropic-beta", "host", "content-length"];
 
@@ -195,9 +195,19 @@ function loadSpecCache(): void {
   try {
     if (!existsSync(SPEC_CACHE_PATH)) return;
     const raw = JSON.parse(readFileSync(SPEC_CACHE_PATH, "utf8"));
-    if (Date.now() - (raw.fetchedAt || 0) > SPEC_CACHE_TTL) return;
-    remoteSpecStore = new Map(raw.specs ?? []);
-  } catch {
+    const fetchedAt = raw.fetchedAt || 0;
+    if (Date.now() - fetchedAt > SPEC_CACHE_TTL) {
+      console.log(`[custom-provider] 规格缓存已过期（>24h），将后台刷新`);
+      return;
+    }
+    if (!Array.isArray(raw.specs)) {
+      console.warn(`[custom-provider] 规格缓存格式错误，已忽略`);
+      return;
+    }
+    remoteSpecStore = new Map(raw.specs);
+    console.log(`[custom-provider] 加载规格缓存: ${remoteSpecStore.size} 个模型`);
+  } catch (error) {
+    console.warn(`[custom-provider] 读取规格缓存失败，将使用预设降级:`, error instanceof Error ? error.message : String(error));
     remoteSpecStore = null;
   }
 }
@@ -205,13 +215,15 @@ function loadSpecCache(): void {
 function saveSpecCache(): void {
   try {
     if (!remoteSpecStore) return;
-    writeFileSync(
-      SPEC_CACHE_PATH,
-      JSON.stringify({ fetchedAt: Date.now(), specs: [...remoteSpecStore.entries()] }),
-      "utf8"
-    );
-  } catch {
-    /* 缓存写失败不影响主流程 */
+    const cacheData = {
+      fetchedAt: Date.now(),
+      specs: [...remoteSpecStore.entries()],
+      version: 1, // 添加版本号，便于未来迁移
+    };
+    writeFileSync(SPEC_CACHE_PATH, JSON.stringify(cacheData), "utf8");
+    console.log(`[custom-provider] 保存规格缓存: ${remoteSpecStore.size} 个模型`);
+  } catch (error) {
+    console.warn(`[custom-provider] 保存规格缓存失败:`, error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -315,15 +327,17 @@ interface IProvider {
   headers?: Record<string, string>;
   authHeader?: boolean;
   compat?: Record<string, any>;
-  /** 可选 HTTP/SOCKS 代理地址（含端口，支持 $ENV 引用）。
-   *  生效方式：注册时写入 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量，
-   *  需请求库读取这些变量（Node 21+ 的 fetch 需启用 NODE_USE_ENV_PROXY=1） */
-  proxy?: string;
+  /** 代理配置：
+   * - "disable": 明确不走代理（覆盖全局环境变量）
+   * - "http://host:port" 或 "https://host:port": 该 provider 走指定代理
+   * - 不配置: 继承 process.env 的 HTTPS_PROXY 等环境变量（默认行为）
+   * - 支持 $ENV 引用和 !cmd 执行
+   */
+  proxy?: "disable" | string;
   /** 多 Key 负载均衡：逗号分隔的 API Key 列表（支持 $ENV / !cmd 引用） */
   lbKeys?: string[];
   /** 负载均衡默认冷却时间（秒），不填默认 60 */
   lbCooldown?: number;
-
   /** false 表示已禁用（不注册、不出现在 /model）；缺失视为启用 */
   enabled?: boolean;
   models: (string | IModel)[];
@@ -331,16 +345,32 @@ interface IProvider {
 
 interface IConfig {
   providers: IProvider[];
+  /** 已废弃：改用 provider 级的 proxy 参数直接指定代理 URL */
+  proxyUrl?: string;
 }
 
 function loadConfig(): IConfig {
   try {
     if (!existsSync(CONFIG_PATH)) return { providers: [] };
     const raw = readFileSync(CONFIG_PATH, "utf8");
+    if (!raw.trim()) {
+      console.warn(`[custom-provider] 配置文件为空: ${CONFIG_PATH}`);
+      return { providers: [] };
+    }
     const config = JSON.parse(raw) as IConfig;
+    if (!config || typeof config !== "object" || !Array.isArray(config.providers)) {
+      console.error(`[custom-provider] 配置文件格式错误: ${CONFIG_PATH}，期望 {providers: [...]}）`);
+      return { providers: [] };
+    }
     return config;
   } catch (error) {
-    console.error(`[custom-provider] 读取 ${CONFIG_PATH} 失败:`, error);
+    if (error instanceof SyntaxError) {
+      console.error(`[custom-provider] 配置文件 JSON 解析失败: ${CONFIG_PATH}`);
+      console.error(`  错误: ${error.message}`);
+      console.error(`  请检查 JSON 格式是否正确，或删除该文件重新配置`);
+    } else {
+      console.error(`[custom-provider] 读取配置文件失败: ${CONFIG_PATH}`, error);
+    }
     return { providers: [] };
   }
 }
@@ -365,16 +395,20 @@ function resolveValue(raw: string | undefined): string {
     const varName = raw.startsWith("${") && raw.endsWith("}")
       ? raw.slice(2, -1)
       : raw.slice(1);
-    return process.env[varName] || "";
-  }
-
-  // 命令执行: !command
-  if (raw.startsWith("!")) {
-    try {
-      return execSync(raw.slice(1), { encoding: "utf8" }).trim();
-    } catch {
+    const value = process.env[varName];
+    if (!value) {
+      console.warn(`[custom-provider] 环境变量 ${varName} 未设置或为空`);
       return "";
     }
+    return value;
+  }
+
+  // 命令执行: !command（已禁用，安全风险过高）
+  // 保留此代码块仅用于向后兼容性说明，实际不执行
+  if (raw.startsWith("!")) {
+    console.error(`[custom-provider] 命令执行已禁用（安全风险）: ${raw}`);
+    console.error(`[custom-provider] 请改用环境变量: export MY_VAR=$(${raw.slice(1)})`);
+    return "";
   }
 
   return raw;
@@ -525,6 +559,11 @@ function buildProviderConfig(provider: IProvider): ProviderConfig {
     providerHeaders["X-LB-POOL"] = provider.name;
   }
 
+  // 代理配置：注入 X-PROXY-CONFIG 标记头（before_provider_request 检测此标记注入 env）
+  if (provider.proxy && typeof provider.proxy === "string") {
+    providerHeaders["X-PROXY-CONFIG"] = provider.proxy;
+  }
+
   if (Object.keys(providerHeaders).length > 0) {
     providerConfig.headers = providerHeaders;
   }
@@ -534,15 +573,6 @@ function buildProviderConfig(provider: IProvider): ProviderConfig {
     providerConfig.authHeader = true;
   } else if (provider.authHeader) {
     providerConfig.authHeader = true;
-  }
-
-  // 代理：写入环境变量使底层请求走代理（仅当用户显式配置且未设置时；
-  // 注意 Node 的 fetch 需 NODE_USE_ENV_PROXY=1 才启用，详见 README）
-  const proxyUrl = provider.proxy ? resolveValue(provider.proxy) : undefined;
-  if (proxyUrl) {
-    if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = proxyUrl;
-    if (!process.env.HTTP_PROXY) process.env.HTTP_PROXY = proxyUrl;
-    if (!process.env.ALL_PROXY) process.env.ALL_PROXY = proxyUrl;
   }
 
   const baseCompat = provider.compat || {};
@@ -595,15 +625,8 @@ async function fetchModels(
     try {
       const json = await httpGet(url, bearerKey, requestHeaders);
 
-      // 支持多种响应格式
-      let models: string[] = [];
-      if (json.data && Array.isArray(json.data)) {
-        models = json.data.map((m: any) => m.id || m.name).filter(Boolean);
-      } else if (Array.isArray(json)) {
-        models = json.map((m: any) => m.id || m.name || m).filter(Boolean);
-      } else if (json.models && Array.isArray(json.models)) {
-        models = json.models.map((m: any) => m.id || m.name || m).filter(Boolean);
-      }
+      // 使用统一的解析函数
+      const models = parseModelListResponse(json);
 
       if (models.length > 0) {
         return models;
@@ -643,8 +666,8 @@ function httpGet(
 
     const req = lib.request(options, (res) => {
       let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
+      const onData = (chunk: any) => (data += chunk);
+      const onEnd = () => {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           try {
             resolve(JSON.parse(data));
@@ -652,21 +675,41 @@ function httpGet(
             reject(new Error(`JSON 解析失败: ${e}`));
           }
         } else {
-          reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+          reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage || "Unknown error"}`));
         }
+      };
+
+      res.on("data", onData);
+      res.on("end", onEnd);
+
+      // 清理：超时时移除事件监听器
+      req.once("timeout", () => {
+        res.removeListener("data", onData);
+        res.removeListener("end", onEnd);
       });
     });
 
     req.on("error", reject);
     req.setTimeout(timeoutMs, () => {
       req.destroy();
-      reject(new Error("请求超时"));
+      reject(new Error(`请求超时（${timeoutMs}ms）`));
     });
     req.end();
   });
 }
 
-// ---- 自动探测端点：试多种协议路径，返回成功获取的协议类型+模型列表 ----
+// 从响应中解析模型列表（支持多种格式）
+function parseModelListResponse(json: any): string[] {
+  let models: string[] = [];
+  if (json.data && Array.isArray(json.data)) {
+    models = json.data.map((m: any) => m.id || m.name).filter(Boolean);
+  } else if (Array.isArray(json)) {
+    models = json.map((m: any) => m.id || m.name || m).filter(Boolean);
+  } else if (json.models && Array.isArray(json.models)) {
+    models = json.models.map((m: any) => m.id || m.name || m).filter(Boolean);
+  }
+  return models;
+}
 async function probeEndpoint(
   url: string,
   apiKey?: string,
@@ -692,15 +735,8 @@ async function probeEndpoint(
       }
       const mergedHeaders = { ...resolveHeaders(headers), ...authHeaders };
       const json = await httpGet(ep, useXApiKey ? undefined : resolvedKey, Object.keys(mergedHeaders).length > 0 ? mergedHeaders : undefined, 8000);
-      // 解析模型列表
-      let models: string[] = [];
-      if (json.data && Array.isArray(json.data)) {
-        models = json.data.map((m: any) => m.id || m.name).filter(Boolean);
-      } else if (Array.isArray(json)) {
-        models = json.map((m: any) => m.id || m.name || m).filter(Boolean);
-      } else if (json.models && Array.isArray(json.models)) {
-        models = json.models.map((m: any) => m.id || m.name || m).filter(Boolean);
-      }
+      // 使用统一的解析函数
+      const models = parseModelListResponse(json);
       if (models.length > 0) return { api, models };
     } catch {
       continue;
@@ -805,7 +841,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   const registerProviders = () => {
     const config = loadConfig();
     config.providers.forEach((provider) => {
-      if (provider.enabled === false) return; // 已禁用的不注册
+      if (provider.enabled === false) return;
       try {
         const providerConfig = buildProviderConfig(provider);
         pi.registerProvider(provider.name, providerConfig);
@@ -912,7 +948,10 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       console.log(`[custom-provider] 已自动调整端点: → ${normalized}`);
     }
     if (typeof data.authHeader === "boolean") provider.authHeader = data.authHeader;
-    if (typeof data.proxy === "string" && data.proxy.trim()) provider.proxy = data.proxy;
+    if (typeof data.proxy === "string" && data.proxy.trim()) {
+      // 支持 "disable" 或直接指定代理 URL
+      provider.proxy = data.proxy.trim();
+    }
     if (typeof data.enabled === "boolean") provider.enabled = data.enabled;
     // 多 Key 负载均衡（JSON 路径）：lbKeys: ["$KEY_A","sk-plain"], lbCooldown: 30
     if (Array.isArray(data.lbKeys) && (data.lbKeys as string[]).length > 0) {
@@ -977,6 +1016,8 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     cooldownEnd: number[];    // 每个 key 的冷却结束时间戳
     consecutive429s: number[];// 指数退避计数
     perKeyCooldowns: (number | null | undefined)[]; // 每 key 的冷却覆盖
+    // 添加互斥锁，防止并发竞态
+    private picking: boolean = false;
 
     constructor(keys: string[], defaultCooldownSec: number, perKey?: (number | null | undefined)[]) {
       this.keys = keys;
@@ -986,24 +1027,35 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       this.perKeyCooldowns = perKey ?? [];
     }
 
-    pick(): string | null {
-      const n = this.keys.length;
-      const now = Date.now();
-      // 最多遍历一轮，找到未在冷却中的 key
-      for (let i = 0; i < n; i++) {
-        const idx = (this.cursor + i) % n;
-        if (this.cooldownEnd[idx] <= now) {
-          this.cursor = (idx + 1) % n; // 下次从下一个开始
-          return this.keys[idx];
+    pick(): { key: string; index: number } | null {
+      // 简单的自旋锁，避免并发选择同一个 key
+      if (this.picking) {
+        // 如果正在选择，等待一个微任务后重试（最多重试一次）
+        return null;
+      }
+      this.picking = true;
+
+      try {
+        const n = this.keys.length;
+        const now = Date.now();
+        // 最多遍历一轮，找到未在冷却中的 key
+        for (let i = 0; i < n; i++) {
+          const idx = (this.cursor + i) % n;
+          if (this.cooldownEnd[idx] <= now) {
+            this.cursor = (idx + 1) % n; // 下次从下一个开始
+            return { key: this.keys[idx], index: idx };
+          }
         }
+        // 全部冷却中，返回冷却结束最早的（允许微小过期）
+        let bestIdx = 0;
+        for (let i = 1; i < n; i++) {
+          if (this.cooldownEnd[i] < this.cooldownEnd[bestIdx]) bestIdx = i;
+        }
+        this.cursor = (bestIdx + 1) % n;
+        return { key: this.keys[bestIdx], index: bestIdx };
+      } finally {
+        this.picking = false;
       }
-      // 全部冷却中，返回冷却结束最早的（允许微小过期）
-      let bestIdx = 0;
-      for (let i = 1; i < n; i++) {
-        if (this.cooldownEnd[i] < this.cooldownEnd[bestIdx]) bestIdx = i;
-      }
-      this.cursor = (bestIdx + 1) % n;
-      return this.keys[bestIdx];
     }
 
     on429(idx: number): void {
@@ -1027,8 +1079,6 @@ export default function customProviderExtension(pi: ExtensionAPI) {
 
   // 运行时 LB 状态：provider name → key pool
   let lbPools: Map<string, LBKeyPool> = new Map();
-  let lastUsedPool: string | null = null; // 上一次请求的 provider name
-  let lastUsedKeyIdx: number = -1;
 
   function loadLBPools(): void {
     lbPools.clear();
@@ -1049,38 +1099,89 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   // 加载 LB 池 + 注册事件（启动时执行一次）
   loadLBPools();
 
+  // ================= 代理与负载均衡钩子 =================
+
+  // before_provider_request：注入代理配置到请求的 env 字段
+  pi.on("before_provider_request", (event, ctx) => {
+    // 从 model.headers 中提取 X-PROXY-CONFIG（buildProviderConfig 时注入）
+    const model = ctx.model;
+    if (!model?.headers) return;
+
+    const proxyConfig = model.headers["X-PROXY-CONFIG"] as string | undefined;
+    if (!proxyConfig) return;
+
+    // 解析代理配置
+    const resolved = resolveValue(proxyConfig);
+
+    // 注入到请求 payload 的 env 字段（pi-ai SDK 会读取）
+    // 注意：event.payload 是即将发送给 SDK 的请求选项对象
+    const payload = event.payload as any;
+    if (!payload) return;
+
+    // 初始化 env 字段
+    if (!payload.env) {
+      payload.env = {};
+    }
+
+    if (resolved === "disable") {
+      // 明确禁用代理：清空代理环境变量
+      payload.env.HTTPS_PROXY = "";
+      payload.env.HTTP_PROXY = "";
+      payload.env.ALL_PROXY = "";
+      payload.env.NO_PROXY = "*";
+    } else if (resolved) {
+      // 设置代理 URL
+      payload.env.HTTPS_PROXY = resolved;
+      payload.env.HTTP_PROXY = resolved;
+      payload.env.ALL_PROXY = resolved;
+    }
+    // 不配置 proxy 时：不修改 payload.env，继承 process.env（SDK 默认行为）
+  });
+
+  // before_provider_headers：LB key 轮询
   pi.on("before_provider_headers", (event) => {
-    // 检测 X-LB-POOL 标记头 → 识别为 LB provider 的请求
+    // 移除标记头（不转发给上游）
+    delete event.headers["X-PROXY-CONFIG"];
+
+    // ---- LB key 轮询 ----
     const poolName = event.headers["X-LB-POOL"] as string | undefined;
     if (!poolName) return;
+    delete event.headers["X-LB-POOL"];
+
     const pool = lbPools.get(poolName);
-    if (!pool) {
-      delete event.headers["X-LB-POOL"];
+    if (!pool) return;
+
+    const picked = pool.pick();
+    if (!picked) {
+      console.warn(`[custom-provider] LB pool "${poolName}" 无可用 key（全部冷却中或并发冲突）`);
       return;
     }
-    const key = pool.pick();
-    if (!key) {
-      delete event.headers["X-LB-POOL"];
-      return;
-    }
+
+    const { key, index: keyIdx } = picked;
     // 记录本次使用的 key 索引（用于 after_provider_response 冷却）
-    const keyIdx = pool.keys.indexOf(key);
-    lastUsedPool = poolName;
-    lastUsedKeyIdx = keyIdx;
+    // 通过 headers 传递上下文，避免全局变量竞态
+    event.headers["X-LB-KEY-INDEX"] = String(keyIdx);
     // 替换 Authorization 为真实 key（SDK 已发送 Bearer $LB）
     event.headers["Authorization"] = `Bearer ${key}`;
-    // 移除标记头（不转发给上游）
-    delete event.headers["X-LB-POOL"];
   });
 
   pi.on("after_provider_response", (event) => {
-    if (!lastUsedPool || lastUsedKeyIdx < 0) return;
-    const pool = lbPools.get(lastUsedPool);
+    // 从 headers 中读取 key 索引（before_provider_headers 中设置）
+    const poolName = event.headers["x-lb-pool"];
+    const keyIdxStr = event.headers["x-lb-key-index"];
+    if (!poolName || !keyIdxStr) return;
+
+    const pool = lbPools.get(poolName);
     if (!pool) return;
+
+    const keyIdx = Number(keyIdxStr);
+    if (isNaN(keyIdx) || keyIdx < 0 || keyIdx >= pool.keys.length) return;
+
     if (event.status === 429) {
-      pool.on429(lastUsedKeyIdx);
+      pool.on429(keyIdx);
+      console.warn(`[custom-provider] LB key #${keyIdx} 触发 429，进入冷却`);
     } else if (event.status >= 200 && event.status < 300) {
-      pool.onSuccess(lastUsedKeyIdx);
+      pool.onSuccess(keyIdx);
     }
   });
 
@@ -1282,21 +1383,27 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`已自动调整端点: ${baseUrl} → ${finalBaseUrl}`, "info");
       }
 
-      // ---- 4.5 代理（可选：需要走代理出网的渠道，如本地/公司代理）----
-      const needProxy = await ctx.ui.confirm(
-        "需要通过代理访问此渠道吗？",
-        "如本地代理 http://127.0.0.1:7890 或公司代理；不支持可跳过（选 No）"
+      // ---- 4.5 代理配置（每个 provider 独立配置）----
+      const proxyChoice = await ctx.ui.select(
+        "代理配置？",
+        ["不走代理（继承环境变量）", "指定代理地址", "明确禁用代理（disable）"]
       );
-      let proxyUrl: string | undefined;
-      if (needProxy) {
+      let proxyMode: string | undefined;
+      if (proxyChoice && proxyChoice.startsWith("指定")) {
         const proxyInput = await ctx.ui.input(
-          "代理地址（http://host:port 或 socks5://host:port，支持 $ENV 引用）",
+          "代理地址（http://host:port 或 https://host:port，支持 $ENV 引用）",
           "http://127.0.0.1:7890"
         );
-        proxyUrl = proxyInput?.trim() || undefined;
-        if (proxyUrl) {
-          ctx.ui.notify(`将请求经代理 ${proxyUrl} 出网（需 NODE_USE_ENV_PROXY=1 生效，见 README）`, "info");
+        const url = proxyInput?.trim();
+        if (url) {
+          proxyMode = url;
+          ctx.ui.notify(`该 provider 将走代理: ${url}`, "info");
+        } else {
+          ctx.ui.notify("未提供代理地址，跳过代理配置", "info");
         }
+      } else if (proxyChoice && proxyChoice.startsWith("明确")) {
+        proxyMode = "disable";
+        ctx.ui.notify("该 provider 将明确不走代理（覆盖环境变量）", "info");
       }
 
       // ---- 4.6 多 Key 负载均衡（应对 RPM/RTM 限制；选 Yes 输入多个 API Key）----
@@ -1563,7 +1670,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         apiKey,
         models,
       };
-      if (proxyUrl) newProvider.proxy = proxyUrl;
+      if (proxyMode) newProvider.proxy = proxyMode;
       if (lbKeys && lbKeys.length > 0) {
         newProvider.lbKeys = lbKeys;
         if (lbCooldown) newProvider.lbCooldown = lbCooldown;
@@ -1698,7 +1805,10 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       models,
     };
     const proxyFlag = getFlag(flags, "proxy");
-    if (proxyFlag) provider.proxy = proxyFlag;
+    if (proxyFlag) {
+      // 支持 "disable" 或直接指定代理 URL
+      provider.proxy = proxyFlag === "disable" ? "disable" : proxyFlag;
+    }
     if (apiRaw && apiRaw !== "auto") provider.api = apiRaw;
     else if (api !== "openai-completions") provider.api = api;
     if (getFlag(flags, "auth-header")) provider.authHeader = true;
@@ -2296,17 +2406,30 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     "  --header \"K: V\"（可多次）· --headers '{\"k\":\"v\"}'",
     "  --profile <模板键>（完整请求头模板：claude-code / codex / browser 等）",
     "  --ua <预设键|原始UA>（如 claude-code / codex / browser）",
-    "  --auth-header · --proxy <URL>（HTTP/SOCKS 代理，$ENV 可用）",
+    "  --proxy <URL|disable>（指定代理地址或明确禁用，如 http://127.0.0.1:7890 或 disable，支持 $ENV）",
+    "  --auth-header",
     "  --lb-keys \"$K1,$K2\"（多 Key 负载均衡）· --lb-cooldown 60（冷却秒数）",
     "  --model-api 'id:协议'（可多次，如 claude-x:anthropic-messages）",
     "  --model-base-url 'id:url'（和 --model-api 搭配混用双协议）",
     "  --compat '{...}' · --overrides '{\"modelId\":{...}}'",
     "  --force（覆盖已存在）· --json '{...}'（完整配置）",
     "  ",
+    "代理配置说明:",
+    "  - proxy: \"http://127.0.0.1:7890\" → 该 provider 走指定代理",
+    "  - proxy: \"disable\" → 明确不走代理（覆盖环境变量）",
+    "  - 不配置 proxy → 继承 process.env 的 HTTPS_PROXY 等环境变量",
+    "  - 每个 provider 的代理配置互相独立，互不干扰",
+    "  ",
     "负载均衡示例（同渠道多 Key 轮询，429 后自动冷却 60s）:",
     "  /custom-provider add relay --base-url https://api.gw.com/v1 \\",
     "      --lb-keys \"$KEY_A,$KEY_B,sk-plain\" --lb-cooldown 60 --force",
     "  JSON: --json '{\"name\":\"relay\",\"baseUrl\":\"...\",\"lbKeys\":[\"k1\",\"k2\"],\"lbCooldown\":30}'",
+    "  ",
+    "代理配置示例:",
+    "  /custom-provider add overseas --base-url https://api.openai.com/v1 \\",
+    "      --api-key $OPENAI_KEY --models gpt-4 --proxy http://127.0.0.1:7890",
+    "  /custom-provider add local --base-url http://localhost:8080/v1 \\",
+    "      --models llama-3 --proxy disable",
     "  ",
 "示例:",
     "  /custom-provider add deepseek --base-url https://api.deepseek.com/v1 \\",

@@ -23,6 +23,9 @@
 
 零运行时依赖，仅使用 Node.js 内置模块（`fs` / `child_process` / `http` / `https` / `os` / `path`）。
 
+> [!IMPORTANT]
+> **安全更新**：v0.1.5+ 已禁用 `!command` 特性（命令注入风险）并修复 HTTP 头注入、并发竞态等问题。详见 [SECURITY-FIXES.md](SECURITY-FIXES.md)。
+
 ---
 
 ## 安装
@@ -105,7 +108,7 @@ pi install local:/path/to/custom-provider
 | `--ua <key\|string>` | 单独设置 User-Agent（预设键或原始字符串） |
 | `--header "K: V"` | 自定义请求头（可多次，支持 `$ENV`） |
 | `--headers '{"k":"v"}'` | JSON 形式设置请求头 |
-| `--proxy <URL>` | HTTP/SOCKS 代理地址 |
+| `--proxy <URL\|disable>` | 代理配置（URL 或 `disable`，支持 `$ENV`） |
 | `--lb-keys "$K1,$K2"` | 多 Key 负载均衡 |
 | `--lb-cooldown N` | 冷却时间（秒，默认 60） |
 | `--model-api "id:协议"` | 按模型覆盖协议（可多次） |
@@ -205,15 +208,56 @@ pi install local:/path/to/custom-provider
 - `list` 显示活跃 Key 数：`3 Key（2 活跃 / 60s 冷却）`
 - 单 key 模式完全向后兼容（`apiKey` 字符串）
 
-### 代理
+### 代理配置（每个 provider 独立）
+
+每个 provider 可以独立配置代理，互不干扰：
 
 ```bash
-/custom-provider add my --base-url https://api.deepseek.com/v1 \
-    --api-key $KEY --models deepseek-chat --proxy http://127.0.0.1:7890
+# 不配置 proxy → 继承 process.env 的 HTTPS_PROXY 等环境变量（默认行为）
+/custom-provider add local --base-url http://localhost:8080/v1 --models llama-3
+
+# 指定代理地址 → 该 provider 走指定代理
+/custom-provider add overseas --base-url https://api.openai.com/v1 \
+    --api-key $OPENAI_KEY --models gpt-4 --proxy http://127.0.0.1:7890
+
+# 明确禁用代理 → 覆盖环境变量，该 provider 不走代理
+/custom-provider add cn-api --base-url https://api.deepseek.com/v1 \
+    --api-key $DEEPSEEK_KEY --models deepseek-chat --proxy disable
+
+# 从环境变量读取代理地址
+/custom-provider add flexible --base-url https://api.example.com/v1 \
+    --api-key $KEY --models model-x --proxy '$MY_PROXY_URL'
 ```
 
-> [!NOTE]
-> Node.js `fetch` 需要 `NODE_USE_ENV_PROXY=1` 才读取代理环境变量；传统 `http.request` 不读取。
+**工作原理**：
+
+- 代理配置通过 pi-ai SDK 的 `env` 字段传递，每个请求独立设置
+- 支持 `http://` 和 `https://` 协议（不支持 SOCKS，pi-ai SDK 限制）
+- `proxy: "disable"` 会在请求中设置 `NO_PROXY=*`，强制不走代理
+- 不配置时，SDK 读取 `process.env` 的 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+
+**JSON 配置示例**：
+
+```json
+{
+  "providers": [
+    {
+      "name": "overseas",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "$OPENAI_KEY",
+      "proxy": "http://127.0.0.1:7890",
+      "models": ["gpt-4"]
+    },
+    {
+      "name": "local",
+      "baseUrl": "http://localhost:8080/v1",
+      "apiKey": "local",
+      "proxy": "disable",
+      "models": ["llama-3"]
+    }
+  ]
+}
+```
 
 ### 多模态（图片输入）
 
@@ -305,7 +349,7 @@ pi install local:/path/to/custom-provider
       "enabled": true,
       "lbKeys": ["$K1", "$K2"],          // 可选：多 Key 负载均衡
       "lbCooldown": 60,
-      "proxy": "http://127.0.0.1:7890",  // 可选：代理
+      "proxy": "http://127.0.0.1:7890",  // 可选：代理（URL / "disable" / 不配置=继承环境变量）
       "headers": { "X-Custom": "value" },
       "models": [
         "deepseek-chat",                                      // 字符串 = provider 默认协议
