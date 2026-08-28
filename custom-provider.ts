@@ -36,10 +36,10 @@ const UA_PRESETS: Record<string, string> = {
 
 // 请求头模板（借鉴 LiveAgent：按客户端/CLI 预设整组请求头，而非只预设 UA）：
 // 不同客户端携带的头集合不同（Claude Code 有 x-app/anthropic-version/X-Stainless-* 等）。
-// 选模板一次性灌入；选"自定义"逐头输入。
+// Apply template headers; or select"custom"逐头输入。
 interface HeaderPreset {
   label: string;
-  key?: string; // undefined = 自定义
+  key?: string; // undefined = custom
   headers: Record<string, string>;
 }
 const HEADER_PRESETS: HeaderPreset[] = [
@@ -69,7 +69,7 @@ const HEADER_PRESETS: HeaderPreset[] = [
     headers: { "User-Agent": UA_PRESETS.openwebui, "accept": "application/json" },
   },
   { label: "ChatGPT Desktop", key: "chatgpt", headers: { "User-Agent": UA_PRESETS.chatgpt } },
-  { label: "自定义（逐头输入）", key: undefined, headers: {} },
+  { label: "custom（逐头输入）", key: undefined, headers: {} },
 ];
 
 // 头名校验：HTTP token 字符集（含 ASCII 特殊符号，无空格/换行）
@@ -91,8 +91,8 @@ function hasHeader(headers: Record<string, string> | undefined, name: string): b
 // ---- 远程规格查询（OpenRouter 公开目录，带磁盘缓存）----
 
 // 输出上限处置（借鉴 LiveAgent normalizeModelLimits）
-// 社区目录/中转对不公布独立输出上限的模型常给退化值"输出==窗口"，
-// 照单全收会把"窗口−输出预留"的输入预算挤成零。处理：钳到保守上限，
+// Community catalogs may provide degraded values for models"output==window"，
+// 照单全收会把"window-output-reserve"的输入预算挤成零。处理：钳到保守上限，
 // 并保底留 3/4 窗口给输入。
 const MAX_OUTPUT_TOKEN_CAP = 32000;
 
@@ -1265,10 +1265,10 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         }
       }
 
-      // ---- 选择添加方式：简单（自动探测+模型）/ 自定义（完整配置）----
+      // ---- 选择添加方式：简单（自动探测+模型）/ custom（完整配置）----
       const addMode = await ctx.ui.select(
         "添加方式？",
-        ["简单添加（自动探测协议 + 模型列表）", "自定义配置（代理/LB/请求头模板/高级选项）"]
+        ["简单添加（自动探测协议 + 模型列表）", "custom配置（代理/LB/请求头模板/高级选项）"]
       );
       if (!addMode) return;
 
@@ -1335,7 +1335,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // ================= 自定义配置路径（完整向导 2-10 步）=================
+      // ================= custom配置路径（完整向导 2-10 步）=================
       // ---- 2. 端点 ----
       const baseUrl = await ctx.ui.input(
         "API 端点 URL（完整地址，通常含 /v1；粘贴 /v1/models 也会被自动清理）",
@@ -1370,7 +1370,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
 
       // ---- 4. 协议类型 ----
       const apiType = await ctx.ui.select(
-        "API 协议类型（推荐"自动推断"，按 URL 自动识别）",
+        "API protocol type (auto-detect recommended)",
         ["自动推断", "openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]
       );
       if (!apiType) return;
@@ -1438,7 +1438,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         "若服务支持模型列表端点可自动获取；否则将手动输入"
       );
 
-      // ---- 6. 请求头模板（预设整组请求头，不同 CLI 头集合不同；选"自定义"逐头输入）----
+      // ---- 6. 请求头模板（预设整组请求头，不同 CLI 头集合不同；选"custom"逐头输入）----
       const presetLabels = HEADER_PRESETS.map((p) => p.label);
       const presetChoice = await ctx.ui.select(
         "请求头模板？",
@@ -1477,9 +1477,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
             );
           } // 浏览器模板 = 不写头，由 pi 自动补充浏览器 UA
         } else {
-          // 自定义：JSON 对象，或每行 "Key: Value"（值支持 $ENV）
+          // custom：JSON 对象，或每行 "Key: Value"（值支持 $ENV）
           const headersInput = await ctx.ui.input(
-            '自定义请求头（JSON 对象，或每行 "Key: Value"：值支持 $ENV；留空取消）',
+            'custom请求头（JSON 对象，或每行 "Key: Value"：值支持 $ENV；留空取消）',
             '{"X-API-Key": "$MY_API_KEY"}'
           );
           if (headersInput && headersInput.trim()) {
@@ -1487,7 +1487,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
             try {
               const parsed = JSON.parse(t);
               if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                applyHeaderSet({ ...parsed }, "自定义请求头");
+                applyHeaderSet({ ...parsed }, "custom请求头");
               } else {
                 ctx.ui.notify("JSON 需为对象（{...}）", "error");
               }
@@ -1507,13 +1507,13 @@ export default function customProviderExtension(pi: ExtensionAPI) {
                 }
                 kv[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
               }
-              if (parseOk) applyHeaderSet(kv, "自定义请求头");
+              if (parseOk) applyHeaderSet(kv, "custom请求头");
             }
           }
         }
       }
 
-      // ---- 7. 补充/覆盖请求头（在模板/自定义基础上追加，可覆盖；无需直接跳过）----
+      // ---- 7. 补充/覆盖请求头（在模板/custom基础上追加，可覆盖；无需直接跳过）----
       const needMore = await ctx.ui.confirm(
         "需要补充/覆盖请求头吗？",
         "在现有头部上追加或覆盖（如 X-API-Key），值支持 $ENV 插值"
@@ -2442,7 +2442,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     description: "管理第三方 Provider：add / remove / refresh / list / test / help",
     getArgumentCompletions: (prefix: string) => {
       // 注意: pi 会用 item.value 替换整个参数段（命令名后的全部文本），
-      // 所以 value 必须是"子命令 + 完整名称"的完整参数，label 才是用于显示的名称。
+      // So value must be"subcommand + full-name"的完整参数，label 才是用于显示的名称。
       const trimmed = prefix.trim();
       const match = trimmed.match(/^(\S+)(?:\s+(.*))?$/);
       const first = (match?.[1] ?? "").toLowerCase();
