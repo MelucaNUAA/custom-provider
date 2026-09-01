@@ -1080,6 +1080,28 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       const now = Date.now();
       return this.keys.filter((_, i) => this.cooldownEnd[i] <= now).length;
     }
+
+    /**
+     * 每个 key 的详细状态行：当前是否冷却中，及冷却结束的确切时间/剩余时长。
+     * 用于 list / test 展示。returns lines like "13:05:22 (~58s)" 或 "可用"。
+     */
+    statusLines(): string[] {
+      const now = Date.now();
+      return this.keys.map((k, i) => {
+        const end = this.cooldownEnd[i];
+        if (end <= now) return `      #${i + 1} ${k}：可用（未冷却）`;
+        const remainMs = end - now;
+        const remainSec = Math.ceil(remainMs / 1000);
+        const hh = String(Math.floor(remainMs / 3600000)).padStart(2, "0");
+        const mm = String(Math.floor((remainMs % 3600000) / 60000)).padStart(2, "0");
+        const ss = String(Math.floor((remainMs % 60000) / 1000)).padStart(2, "0");
+        const endTime = new Date(end);
+        const hhEnd = String(endTime.getHours()).padStart(2, "0");
+        const mmEnd = String(endTime.getMinutes()).padStart(2, "0");
+        const ssEnd = String(endTime.getSeconds()).padStart(2, "0");
+        return `      #${i + 1} ${k}：冷却中 → ${hhEnd}:${mmEnd}:${ssEnd}（剩余 ${hh}:${mm}:${ss}）`;
+      });
+    }
   }
 
   // 运行时 LB 状态：provider name → key pool
@@ -2149,7 +2171,8 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       const proxyLine = p.proxy ? `\n  代理: ${p.proxy}` : "";
       const lbPool = lbPools.get(p.name);
       const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却）` : "";
-      return `• ${p.name}  [${state}] [${api}]\n  端点: ${p.baseUrl}${proxyLine}${lbLine}\n  模型: ${preview}`;
+      const lbDetail = lbPool ? `\n${lbPool.statusLines().join("\n")}` : "";
+      return `• ${p.name}  [${state}] [${api}]\n  端点: ${p.baseUrl}${proxyLine}${lbLine}${lbDetail}\n  模型: ${preview}`;
     });
     ctx.ui.notify(`已配置 ${config.providers.length} 个 provider:\n\n${lines.join("\n\n")}\n\n启用/禁用: /custom-provider enable|disable <名称>` , "info");
   };
@@ -2167,6 +2190,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     let label: string;
     let lbKeyCount = 0;
     let lbActiveCount = 0;
+    let lbDetailLines: string[] = [];
 
     if (tmpBaseUrl) {
       baseUrl = tmpBaseUrl;
@@ -2200,6 +2224,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       if (pool) {
         lbKeyCount = pool.keys.length;
         lbActiveCount = pool.activeCount();
+        lbDetailLines = pool.statusLines();
       }
     }
 
@@ -2221,6 +2246,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       }
       if (lbKeyCount > 0) {
         statusParts.push(`  LB: ${lbActiveCount}/${lbKeyCount} Key 活跃`);
+        if (lbDetailLines.length > 0) statusParts.push(...lbDetailLines.map((l) => `  ${l.trim()}`));
       }
       ctx.ui.notify(statusParts.join("\n"), "info");
     } catch (error) {
@@ -2371,7 +2397,8 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         const proxyLine = p.proxy ? `\n  代理: ${p.proxy}` : "";
         const lbPool = lbPools.get(p.name);
         const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却）` : "";
-        return `• ${p.name}  [${state}] [${api}]  ${p.models.length} 个模型\n  端点: ${p.baseUrl}${proxyLine}${lbLine}`;
+        const lbDetail = lbPool ? `\n${lbPool.statusLines().join("\n")}` : "";
+        return `• ${p.name}  [${state}] [${api}]  ${p.models.length} 个模型\n  端点: ${p.baseUrl}${proxyLine}${lbLine}${lbDetail}`;
       });
       ctx.ui.notify(
         `配置文件: ${CONFIG_PATH}\n已配置 ${config.providers.length} 个 provider:\n\n${lines.join("\n\n")}\n\nconfig <name> 查看详情 · config edit 编辑 · config path 路径`,

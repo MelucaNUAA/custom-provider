@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] - 2026-09-01
+
+### ✨ Added
+
+- **查看单个 Key 冷却状态**：`list` / `config` / `test` 命令现在展示每个 API Key 的详细状态
+  - 未冷却：`可用（未冷却）`
+  - 冷却中：`冷却中 → HH:MM:SS（剩余 hh:mm:ss）`，即该 Key 的 `cooldownEnd`（冷却结束的确切时刻与剩余时长）
+
+例如运行 `/custom-provider list`：
+
+```
+负载均衡: 3 Key（2 活跃 / 86400s 冷却）
+      #1 sk-AAA：冷却中 → 11:57:40（剩余 24:00:00）
+      #2 sk-BBB：冷却中 → 11:58:40（剩余 00:01:00）
+      #3 sk-CCC：可用（未冷却）
+```
+
+`cooldownEnd` 就是每行“冷却中 → ”后的时刻（该 Key 冷却结束、重新进入轮询池的时间）。
+
+---
+
 ## [0.1.10] - 2026-09-01
 
 ### ✨ Added
