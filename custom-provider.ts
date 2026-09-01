@@ -340,6 +340,12 @@ interface IProvider {
   lbCooldown?: number;
   /** 负载均衡按 Key 冷却时间（秒），与 lbKeys 一一对应，不填用 lbCooldown */
   lbCooldowns?: number[];
+  /**
+   * 负载均衡 Key 调度模式：
+   * - "roundrobin"（默认）：每个请求轮询下一个可用 Key
+   * - "sticky"：粘住当前 Key 使用，直到它 429 进入冷却才切换到下一个可用 Key
+   */
+  lbMode?: "roundrobin" | "sticky";
   /** false 表示已禁用（不注册、不出现在 /model）；缺失视为启用 */
   enabled?: boolean;
   models: (string | IModel)[];
@@ -964,6 +970,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       if (Array.isArray(data.lbCooldowns)) {
         provider.lbCooldowns = (data.lbCooldowns as unknown[]).map(Number);
       }
+      if (data.lbMode === "roundrobin" || data.lbMode === "sticky") {
+        provider.lbMode = data.lbMode;
+      }
     }
     if (data.headers && typeof data.headers === "object") {
       // 与 flags/向导同一套校验：拒绝非法名称/值（含 CR/LF 注入）
@@ -1020,24 +1029,46 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   class LBKeyPool {
     keys: string[];           // 解析后的 key 值
     cooldownMs: number;       // 默认冷却毫秒
-    cursor: number = 0;       // 轮询游标
+    cursor: number = 0;       // 轮询游标（roundrobin 用）
     cooldownEnd: number[];    // 每个 key 的冷却结束时间戳
     perKeyCooldowns: (number | null | undefined)[]; // 每 key 的冷却覆盖
+    mode: "roundrobin" | "sticky"; // 调度模式
+    stickyIdx: number = -1;   // sticky 模式：当前粘住的 key 索引（-1 表示未定）
 
-    constructor(keys: string[], defaultCooldownSec: number, perKey?: (number | null | undefined)[]) {
+    constructor(keys: string[], defaultCooldownSec: number, perKey?: (number | null | undefined)[], mode?: "roundrobin" | "sticky") {
       this.keys = keys;
       this.cooldownMs = defaultCooldownSec * 1000;
       this.cooldownEnd = new Array(keys.length).fill(0);
       this.perKeyCooldowns = perKey ?? [];
+      this.mode = mode ?? "roundrobin";
     }
 
     /**
-     * 严格轮询：从游标起遍历一轮，只返回未处于冷却期（cooldownEnd <= now）的 Key。
+     * 调度选择 Key：
+     * - roundrobin：每次从游标起取下一个未冷却 Key，平摊到所有 Key。
+     * - sticky：粘住 stickyIdx 直到它 429 冷却，冷却后切换到下一个可用 Key 继续粘住。
      * 全部 Key 均冷却中时返回 null —— 绝不挑选冷却中的 Key。
      */
     pick(): { key: string; index: number } | null {
       const n = this.keys.length;
       const now = Date.now();
+      if (this.mode === "sticky") {
+        // 若当前粘住的 Key 可用，就一直用它
+        if (this.stickyIdx >= 0 && this.stickyIdx < n && this.cooldownEnd[this.stickyIdx] <= now) {
+          return { key: this.keys[this.stickyIdx], index: this.stickyIdx };
+        }
+        // 当前 Key 冷却中（或未定）：从它之后找下一个可用 Key，成为新的粘住目标
+        const start = this.stickyIdx >= 0 ? this.stickyIdx + 1 : 0;
+        for (let i = 0; i < n; i++) {
+          const idx = (start + i) % n;
+          if (this.cooldownEnd[idx] <= now) {
+            this.stickyIdx = idx;
+            return { key: this.keys[idx], index: idx };
+          }
+        }
+        return null; // 全部冷却中
+      }
+      // roundrobin：从游标起取下一个未冷却 Key
       for (let i = 0; i < n; i++) {
         const idx = (this.cursor + i) % n;
         if (this.cooldownEnd[idx] <= now) {
@@ -1057,7 +1088,11 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       for (let i = 1; i < this.keys.length; i++) {
         if (this.cooldownEnd[i] < this.cooldownEnd[bestIdx]) bestIdx = i;
       }
-      this.cursor = (bestIdx + 1) % this.keys.length;
+      if (this.mode === "sticky") {
+        this.stickyIdx = bestIdx;
+      } else {
+        this.cursor = (bestIdx + 1) % this.keys.length;
+      }
       return { key: this.keys[bestIdx], index: bestIdx };
     }
 
@@ -1124,6 +1159,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       const defaultCooldown = provider.lbCooldown ?? (provider.compat?.lb?.cooldown as number | undefined) ?? 60;
       // 按 Key 冷却覆盖：与 lbKeys 一一对应；兼容旧格式 compat.lb.cooldowns
       const rawPerKey = provider.lbCooldowns ?? (provider.compat?.lb?.cooldowns as number[] | undefined);
+      // 调度模式：默认 roundrobin，兼容旧格式 compat.lb.mode
+      const lbMode: "roundrobin" | "sticky" =
+        provider.lbMode ?? (provider.compat?.lb?.mode as "roundrobin" | "sticky" | undefined) ?? "roundrobin";
       if (keys.length > 0) {
         const resolved = keys.map(resolveValue);
         const keptIdx: number[] = [];
@@ -1142,7 +1180,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
               return typeof c === "number" && c > 0 ? c : null;
             })
           : undefined;
-        lbPools.set(provider.name, new LBKeyPool(keptKeys, defaultCooldown, perKey));
+        lbPools.set(provider.name, new LBKeyPool(keptKeys, defaultCooldown, perKey, lbMode));
       }
     }
   }
@@ -1495,6 +1533,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       );
       let lbKeys: string[] | undefined;
       let lbCooldown: number | undefined;
+      let lbMode: "roundrobin" | "sticky" | undefined;
       if (needLB) {
         const lbInput = await ctx.ui.input(
           "API Keys（逗号分隔，支持 $ENV / !cmd 引用）",
@@ -1508,9 +1547,14 @@ export default function customProviderExtension(pi: ExtensionAPI) {
           );
           const cd = Number(cdInput?.trim() || "60");
           if (cd > 0) lbCooldown = cd;
+          const modeChoice = await ctx.ui.select(
+            "Key 调度模式？",
+            ["roundrobin：每个请求轮询下一个可用 Key", "sticky：粘住一个 Key 直到它 429 才切换"]
+          );
+          if (modeChoice && String(modeChoice).includes("sticky")) lbMode = "sticky";
         }
         if (lbKeys && lbKeys.length > 0) {
-          ctx.ui.notify(`已启用 ${lbKeys.length} Key 负载均衡，冷却 ${lbCooldown ?? 60}s`, "info");
+          ctx.ui.notify(`已启用 ${lbKeys.length} Key 负载均衡（${lbMode ?? "roundrobin"}），冷却 ${lbCooldown ?? 60}s`, "info");
         }
       }
 
@@ -1756,6 +1800,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       if (lbKeys && lbKeys.length > 0) {
         newProvider.lbKeys = lbKeys;
         if (lbCooldown) newProvider.lbCooldown = lbCooldown;
+        if (lbMode) newProvider.lbMode = lbMode;
       }
 
       if (apiType !== "自动推断" || inferredApi !== "openai-completions") {
@@ -1910,6 +1955,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
           return Number.isFinite(n) && n > 0 ? n : NaN;
         });
       }
+      const lbModeFlag = getFlag(flags, "lb-mode");
+      if (lbModeFlag === "sticky") provider.lbMode = "sticky";
+      else if (lbModeFlag === "roundrobin") provider.lbMode = "roundrobin";
     }
 
     const compatJson = getFlag(flags, "compat");
@@ -2170,7 +2218,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         ids.length <= 4 ? ids.join(", ") : `${ids.slice(0, 4).join(", ")}, …（共 ${ids.length} 个）`;
       const proxyLine = p.proxy ? `\n  代理: ${p.proxy}` : "";
       const lbPool = lbPools.get(p.name);
-      const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却）` : "";
+      const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却 / ${lbPool.mode === "sticky" ? "sticky" : "roundrobin"}）` : "";
       const lbDetail = lbPool ? `\n${lbPool.statusLines().join("\n")}` : "";
       return `• ${p.name}  [${state}] [${api}]\n  端点: ${p.baseUrl}${proxyLine}${lbLine}${lbDetail}\n  模型: ${preview}`;
     });
@@ -2396,7 +2444,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         const state = p.enabled === false ? "✗ 禁用" : "✓ 启用";
         const proxyLine = p.proxy ? `\n  代理: ${p.proxy}` : "";
         const lbPool = lbPools.get(p.name);
-        const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却）` : "";
+        const lbLine = lbPool ? `\n  负载均衡: ${lbPool.keys.length} Key（${lbPool.activeCount()} 活跃 / ${lbPool.cooldownMs / 1000}s 冷却 / ${lbPool.mode === "sticky" ? "sticky" : "roundrobin"}）` : "";
         const lbDetail = lbPool ? `\n${lbPool.statusLines().join("\n")}` : "";
         return `• ${p.name}  [${state}] [${api}]  ${p.models.length} 个模型\n  端点: ${p.baseUrl}${proxyLine}${lbLine}${lbDetail}`;
       });
@@ -2503,7 +2551,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     "  --ua <预设键|原始UA>（如 claude-code / codex / browser）",
     "  --proxy <URL|disable>（指定代理地址或明确禁用，如 http://127.0.0.1:7890 或 disable，支持 $ENV）",
     "  --auth-header",
-    "  --lb-keys \"$K1,$K2\"（多 Key 负载均衡）· --lb-cooldown 60（默认冷却秒数）· --lb-cooldowns \"30,120\"（按 Key 冷却秒数，与 lbKeys 对齐）",
+    "  --lb-keys \"$K1,$K2\"（多 Key 负载均衡）· --lb-cooldown 60（默认冷却秒数）· --lb-cooldowns \"30,120\"（按 Key 冷却秒数，与 lbKeys 对齐）· --lb-mode sticky（黏住一个 Key 直到 429）",
     "  --model-api 'id:协议'（可多次，如 claude-x:anthropic-messages）",
     "  --model-base-url 'id:url'（和 --model-api 搭配混用双协议）",
     "  --compat '{...}' · --overrides '{\"modelId\":{...}}'",

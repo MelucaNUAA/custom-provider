@@ -17,7 +17,7 @@
 - **多协议混用**：同一 Provider 内不同模型走不同协议（OpenAI / Anthropic / Google）
 - **自动探测**：输入 URL 自动尝试多种协议路径，检测协议类型与可用模型
 - **模型过滤与修剪**：添加时按关键字过滤，事后随时修剪
-- **负载均衡**：多 Key 轮询 + 429 自动冷却（固定时长、冷却期内不参与轮询，全部冷却才兜底）
+- **负载均衡**：多 Key 轮询 + 429 自动冷却（固定时长、冷却期内不参与轮询，全部冷却才兜底）；支持 roundrobin / sticky 两种调度模式
 - **请求头模板**：一键应用 Claude Code / Codex / OpenCode 等客户端的完整请求头集合
 - **智能规格推断**：OpenRouter 实时目录（24h 缓存）→ 本地预设 → 协议级兜底，上下文窗口与输出上限自动修正退化数据
 
@@ -112,6 +112,7 @@ pi install local:/path/to/custom-provider
 | `--lb-keys "$K1,$K2"` | 多 Key 负载均衡（429 后自动冷却，冷却期结束后重新参与轮询） |
 | `--lb-cooldown N` | 冷却时间（秒，默认 60） |
 | `--lb-cooldowns "30,120"` | 按 Key 冷却时间（秒，与 lbKeys 一一对应，可选） |
+| `--lb-mode roundrobin\|sticky` | 调度模式：roundrobin 每个请求轮询，sticky 粘住一个 Key 直到 429（默认 roundrobin） |
 | `--model-api "id:协议"` | 按模型覆盖协议（可多次） |
 | `--model-base-url "id:url"` | 按模型覆盖端点（可多次） |
 | `--auth-header` | 开启 Bearer 认证（非标准 API） |
@@ -198,19 +199,29 @@ pi install local:/path/to/custom-provider
 
 ### 负载均衡
 
-多 Key 轮询 + 429 自动冷却（固定时长）：
+多 Key 负载均衡 + 429 自动冷却（固定时长）），支持两种调度模式：
 
 ```bash
+# roundrobin（默认）：每个请求轮询下一个可用 Key
 /custom-provider add relay --base-url https://api.gw.com/v1 \
     --lb-keys "$KEY_A,$KEY_B,sk-plain" --lb-cooldown 60 --models gpt-4o
+
+# sticky：粘住一个 Key 使用，直到它 429 冷却才切换下一个可用 Key
+#  （某 Key 成功调用后冷却清零，sticky 仍保持当前 Key，不回切）
+/custom-provider add relay --base-url https://api.gw.com/v1 \
+    --lb-keys "$K_A,$K_B" --lb-mode sticky --models gpt-4o
 ```
+
+**调度模式**（`lbMode: "roundrobin" | "sticky"`）：
+- `roundrobin`（默认）：每个请求按序轮流使用下一个未冷却的 Key，平摊请求
+- `sticky`：优先沿用当前 Key；仅当它 429 进入冷却时才切换到下一个可用 Key 并继续粘住
 
 - 触发 429 时该 Key 自动进入冷却，时长固定为配置的 `lbCooldown`（下限 60 秒），不做指数放大/退避
 - 冷却期内该 Key 绝不参与轮询；冷却期结束后自动重新进入轮询池
 - 只要还有任一 Key 未冷却就正常轮询；全部 Key 都 429 冷却时，才强行使用最早恢复的 Key 兜底
 - 某 Key 成功调用后其冷却期清零（立即恢复参与轮询），直到下次 429 再重新计冷却
 - 可按 Key 单独设置冷却：`lbCooldowns: [30, 120]`（与 lbKeys 一一对应；JSON 或添加时用 `--lb-cooldowns "30,120"`，缺失项回退 `lbCooldown`）
-- `list` 显示活跃 Key 数：`3 Key（2 活跃 / 60s 冷却）`
+- `list` 显示活跃 Key 数与模式：`3 Key（2 活跃 / 60s 冷却 / roundrobin）`
 - 单 key 模式完全向后兼容（`apiKey` 字符串）
 
 ### 代理配置（每个 provider 独立）

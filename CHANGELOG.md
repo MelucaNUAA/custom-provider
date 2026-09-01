@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-09-01
+
+### ✨ Added
+
+- **新增 sticky 调度模式**：负载均衡现在支持两种 Key 调度模式（`lbMode`）：
+  - `roundrobin`（默认）：每个请求按序轮询下一个可用 Key，平摊请求
+  - `sticky`：粘住一个 Key 使用，直到它触发 429 进入冷却才切换到下一个可用 Key；该 Key 成功调用后冷却清零但仍保持粘住（不回切）
+  - 可通过 JSON `lbMode: "sticky"`、命令 `--lb-mode sticky` 或交互向导选择
+  - `list` / `config` 的负载均衡行会显示当前模式
+
+---
+
 ## [0.1.11] - 2026-09-01
 
 ### ✨ Added
