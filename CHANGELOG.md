@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-09-01
+
+### ✨ Added
+
+- **负载均衡 429 冷却重写**：多 API Key 冷却期语义修正
+  - 触发 429 后该 Key 进入固定时长冷却（`lbCooldown`，下限 60 秒），不做指数放大/退避
+  - 冷却期内该 Key **绝不参与轮询**，冷却期结束后自动重新进入轮询池
+  - 仍有任一未冷却 Key 时只从可用 Key 中轮询；全部 Key 都 429 冷却时才强行使用最早恢复的 Key 兜底
+  - 某 Key 成功调用后其冷却期清零（立即恢复参与轮询），直到下次 429 重新计冷却
+  - 新增按 Key 独立冷却配置 `lbCooldowns: [30, 120]`（与 `lbKeys` 一一对应），缺失项回退 `lbCooldown`
+
+### 🐛 Fixed
+
+- **429 检测通路修复**（关键）：此前 `after_provider_response` 只在 2xx 流开始时触发，SDK 对 429 直接抛错导致冷却逻辑实际从未生效；新增 `message_end` 从错误消息（errorMessage 含 429/rate limit 等）识别限流并关联到对应 Key
+- **`pick()` 竞态/语义修复**：移除自旋锁 `picking` 造成的并发 null 与占位符 Key 泄漏；全部冷却时不再返回冷却中的 Key
+- 移除旧的 30s 等待上限（`waitForAvailable`），全部冷却时直接立即使用最早恢复 Key，避免请求长时间挂起
+
+---
+
 ## [0.1.5] - 2026-08-28
 
 ### 🔒 Security

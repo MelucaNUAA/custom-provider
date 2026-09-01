@@ -338,6 +338,8 @@ interface IProvider {
   lbKeys?: string[];
   /** 负载均衡默认冷却时间（秒），不填默认 60 */
   lbCooldown?: number;
+  /** 负载均衡按 Key 冷却时间（秒），与 lbKeys 一一对应，不填用 lbCooldown */
+  lbCooldowns?: number[];
   /** false 表示已禁用（不注册、不出现在 /model）；缺失视为启用 */
   enabled?: boolean;
   models: (string | IModel)[];
@@ -959,6 +961,9 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       if (typeof data.lbCooldown === "number" && data.lbCooldown > 0) {
         provider.lbCooldown = data.lbCooldown;
       }
+      if (Array.isArray(data.lbCooldowns)) {
+        provider.lbCooldowns = (data.lbCooldowns as unknown[]).map(Number);
+      }
     }
     if (data.headers && typeof data.headers === "object") {
       // 与 flags/向导同一套校验：拒绝非法名称/值（含 CR/LF 注入）
@@ -1009,66 +1014,66 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   // 原理：LB 模式的 provider 在 headers 里注入 X-LB-POOL: <name> 标记头，
   // before_provider_headers 检测此标记 → 识别为 LB 请求 → 替换 Authorization
 
+  // 429 / 限流错误识别（覆盖各家上游常见文案：429、rate limit、too many requests 等）
+  const RATE_LIMIT_RE = /\b429\b|rate\s*limit|too\s+many\s+requests|resource\s*exhausted|quota\s*exceeded/i;
+
   class LBKeyPool {
     keys: string[];           // 解析后的 key 值
     cooldownMs: number;       // 默认冷却毫秒
     cursor: number = 0;       // 轮询游标
     cooldownEnd: number[];    // 每个 key 的冷却结束时间戳
-    consecutive429s: number[];// 指数退避计数
     perKeyCooldowns: (number | null | undefined)[]; // 每 key 的冷却覆盖
-    // 添加互斥锁，防止并发竞态
-    private picking: boolean = false;
 
     constructor(keys: string[], defaultCooldownSec: number, perKey?: (number | null | undefined)[]) {
       this.keys = keys;
       this.cooldownMs = defaultCooldownSec * 1000;
       this.cooldownEnd = new Array(keys.length).fill(0);
-      this.consecutive429s = new Array(keys.length).fill(0);
       this.perKeyCooldowns = perKey ?? [];
     }
 
+    /**
+     * 严格轮询：从游标起遍历一轮，只返回未处于冷却期（cooldownEnd <= now）的 Key。
+     * 全部 Key 均冷却中时返回 null —— 绝不挑选冷却中的 Key。
+     */
     pick(): { key: string; index: number } | null {
-      // 简单的自旋锁，避免并发选择同一个 key
-      if (this.picking) {
-        // 如果正在选择，等待一个微任务后重试（最多重试一次）
-        return null;
-      }
-      this.picking = true;
-
-      try {
-        const n = this.keys.length;
-        const now = Date.now();
-        // 最多遍历一轮，找到未在冷却中的 key
-        for (let i = 0; i < n; i++) {
-          const idx = (this.cursor + i) % n;
-          if (this.cooldownEnd[idx] <= now) {
-            this.cursor = (idx + 1) % n; // 下次从下一个开始
-            return { key: this.keys[idx], index: idx };
-          }
+      const n = this.keys.length;
+      const now = Date.now();
+      for (let i = 0; i < n; i++) {
+        const idx = (this.cursor + i) % n;
+        if (this.cooldownEnd[idx] <= now) {
+          this.cursor = (idx + 1) % n; // 下次从下一个开始，天然轮询
+          return { key: this.keys[idx], index: idx };
         }
-        // 全部冷却中，返回冷却结束最早的（允许微小过期）
-        let bestIdx = 0;
-        for (let i = 1; i < n; i++) {
-          if (this.cooldownEnd[i] < this.cooldownEnd[bestIdx]) bestIdx = i;
-        }
-        this.cursor = (bestIdx + 1) % n;
-        return { key: this.keys[bestIdx], index: bestIdx };
-      } finally {
-        this.picking = false;
       }
+      return null; // 全部冷却中：冷却期内不参与轮询
     }
 
+    /**
+     * 全部 Key 都 429 冷却中时的兜底：强行使用最早恢复（冷却最快结束）的 Key。
+     * 仅当没有其它可用 Key 时才启用，正常情况下不会被调用。
+     */
+    fallbackPick(): { key: string; index: number } {
+      let bestIdx = 0;
+      for (let i = 1; i < this.keys.length; i++) {
+        if (this.cooldownEnd[i] < this.cooldownEnd[bestIdx]) bestIdx = i;
+      }
+      this.cursor = (bestIdx + 1) % this.keys.length;
+      return { key: this.keys[bestIdx], index: bestIdx };
+    }
+
+    /**
+     * 触发 429：该 Key 冷却固定为配置的时长（下限 60 秒），不做指数放大/退避。
+     * 冷却期内该 Key 绝不参与轮询。
+     */
     on429(idx: number): void {
-      this.consecutive429s[idx]++;
       const base = this.perKeyCooldowns[idx] ?? this.cooldownMs;
-      // 指数退避：连续429时 × 2^n，上限 10 分钟
-      const multiplier = Math.min(this.consecutive429s[idx], 10);
-      const cooldown = Math.min(base * Math.pow(2, multiplier - 1), 600000);
+      const cooldown = Math.max(base, 60_000); // 下限 60 秒
       this.cooldownEnd[idx] = Date.now() + cooldown;
     }
 
+    /** 该 Key 成功调用：冷却期清零（立即恢复参与轮询），下次 429 再重新计冷却 */
     onSuccess(idx: number): void {
-      this.consecutive429s[idx] = 0;
+      this.cooldownEnd[idx] = 0;
     }
 
     activeCount(): number {
@@ -1079,6 +1084,13 @@ export default function customProviderExtension(pi: ExtensionAPI) {
 
   // 运行时 LB 状态：provider name → key pool
   let lbPools: Map<string, LBKeyPool> = new Map();
+  // 请求-响应关联：model ID → { poolName, keyIdx }
+  // after_provider_response 只能拿到上游响应，无法读取请求头，
+  // 因此在 before_provider_headers 中将选中的 key 信息存入此 Map：
+  //  - after_provider_response 通过 ctx.model.id 取回（HTTP 2xx 成功 / 裸 429 响应）
+  //  - message_end 通过 event.message.model 取回（SDK 对 429 直接抛错、无响应事件，
+  //    但错误会作为 assistant 消息结束，errorMessage 含 "429/rate limit" 等字样）
+  const lbInflight: Map<string, { poolName: string; keyIdx: number; ts: number }> = new Map();
 
   function loadLBPools(): void {
     lbPools.clear();
@@ -1088,10 +1100,27 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       // 优先从 IProvider.lbKeys 读取；兼容旧格式 compat.lb.keys
       const keys: string[] = provider.lbKeys ?? (provider.compat?.lb?.keys as string[] | undefined) ?? [];
       const defaultCooldown = provider.lbCooldown ?? (provider.compat?.lb?.cooldown as number | undefined) ?? 60;
+      // 按 Key 冷却覆盖：与 lbKeys 一一对应；兼容旧格式 compat.lb.cooldowns
+      const rawPerKey = provider.lbCooldowns ?? (provider.compat?.lb?.cooldowns as number[] | undefined);
       if (keys.length > 0) {
-        const resolved = keys.map(resolveValue).filter(Boolean);
-        if (resolved.length === 0) continue;
-        lbPools.set(provider.name, new LBKeyPool(resolved, defaultCooldown));
+        const resolved = keys.map(resolveValue);
+        const keptIdx: number[] = [];
+        const keptKeys: string[] = [];
+        resolved.forEach((v, i) => {
+          if (v) {
+            keptKeys.push(v);
+            keptIdx.push(i);
+          }
+        });
+        if (keptKeys.length === 0) continue;
+        // 按保留的 Key 对齐冷却数组（缺失/非法项回退默认冷却）
+        const perKey: (number | null | undefined)[] | undefined = rawPerKey
+          ? keptIdx.map((i) => {
+              const c = rawPerKey[i];
+              return typeof c === "number" && c > 0 ? c : null;
+            })
+          : undefined;
+        lbPools.set(provider.name, new LBKeyPool(keptKeys, defaultCooldown, perKey));
       }
     }
   }
@@ -1139,49 +1168,80 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   });
 
   // before_provider_headers：LB key 轮询
-  pi.on("before_provider_headers", (event) => {
+  pi.on("before_provider_headers", (event, ctx) => {
     // 移除标记头（不转发给上游）
     delete event.headers["X-PROXY-CONFIG"];
 
     // ---- LB key 轮询 ----
     const poolName = event.headers["X-LB-POOL"] as string | undefined;
     if (!poolName) return;
-    delete event.headers["X-LB-POOL"];
-
     const pool = lbPools.get(poolName);
     if (!pool) return;
 
-    const picked = pool.pick();
-    if (!picked) {
-      console.warn(`[custom-provider] LB pool "${poolName}" 无可用 key（全部冷却中或并发冲突）`);
-      return;
-    }
+    // 严格轮询：只选未冷却的 Key；若全部 Key 都 429 冷却中，则强行使用最早恢复的 Key
+    const picked = pool.pick() ?? pool.fallbackPick();
 
     const { key, index: keyIdx } = picked;
-    // 记录本次使用的 key 索引（用于 after_provider_response 冷却）
-    // 通过 headers 传递上下文，避免全局变量竞态
-    event.headers["X-LB-KEY-INDEX"] = String(keyIdx);
     // 替换 Authorization 为真实 key（SDK 已发送 Bearer $LB）
     event.headers["Authorization"] = `Bearer ${key}`;
+    // 清除标记头（不转发给上游）
+    delete event.headers["X-LB-POOL"];
+
+    // 通过 ctx.model.id 将选中的 key 信息传递给 after_provider_response / message_end
+    // 注意：ctx 由 runner.createContext() 提供，model 在请求期间始终可用
+    const modelId = ctx.model?.id;
+    if (modelId) {
+      lbInflight.set(modelId, { poolName, keyIdx, ts: Date.now() });
+    }
   });
 
-  pi.on("after_provider_response", (event) => {
-    // 从 headers 中读取 key 索引（before_provider_headers 中设置）
-    const poolName = event.headers["x-lb-pool"];
-    const keyIdxStr = event.headers["x-lb-key-index"];
-    if (!poolName || !keyIdxStr) return;
+  pi.on("after_provider_response", (event, ctx) => {
+    // 从 lbInflight Map 中取回 before_provider_headers 存入的 key 信息
+    const modelId = ctx.model?.id;
+    if (!modelId) return;
+    const info = lbInflight.get(modelId);
+    if (!info) return;
+    lbInflight.delete(modelId);
 
-    const pool = lbPools.get(poolName);
+    const pool = lbPools.get(info.poolName);
     if (!pool) return;
 
-    const keyIdx = Number(keyIdxStr);
-    if (isNaN(keyIdx) || keyIdx < 0 || keyIdx >= pool.keys.length) return;
-
     if (event.status === 429) {
-      pool.on429(keyIdx);
-      console.warn(`[custom-provider] LB key #${keyIdx} 触发 429，进入冷却`);
+      pool.on429(info.keyIdx);
+      console.warn(`[custom-provider] LB key #${info.keyIdx} (${info.poolName}) 上游返回 429，进入冷却`);
     } else if (event.status >= 200 && event.status < 300) {
-      pool.onSuccess(keyIdx);
+      pool.onSuccess(info.keyIdx);
+    }
+  });
+
+  // message_end：429 错误兜底检测。
+  // SDK 对 429 直接抛错（after_provider_response 收不到响应事件），但错误会以
+  // stopReason:"error" 的 assistant 消息结束，这里从 errorMessage 识别限流并冷却对应 Key。
+  // 其他结束（成功/中断/非限流错误）仅清理关联，不触发冷却。
+  pi.on("message_end", (event) => {
+    const msg = event.message as {
+      model?: unknown;
+      stopReason?: unknown;
+      errorMessage?: unknown;
+    };
+    if (typeof msg.model !== "string") return;
+    const info = lbInflight.get(msg.model);
+    if (!info) return;
+    lbInflight.delete(msg.model);
+
+    if (
+      msg.stopReason === "error" &&
+      typeof msg.errorMessage === "string" &&
+      RATE_LIMIT_RE.test(msg.errorMessage)
+    ) {
+      const pool = lbPools.get(info.poolName);
+      if (pool) {
+        pool.on429(info.keyIdx);
+        console.warn(
+          `[custom-provider] LB key #${info.keyIdx} (${info.poolName}) 触发 429，` +
+          `进入冷却（${msg.errorMessage.slice(0, 120)}）`
+        );
+      }
     }
   });
 
@@ -1820,6 +1880,14 @@ export default function customProviderExtension(pi: ExtensionAPI) {
         const n = Number(lbCooldownFlag);
         if (n > 0) provider.lbCooldown = n;
       }
+      const lbCooldownsFlag = getFlag(flags, "lb-cooldowns");
+      if (lbCooldownsFlag) {
+        // 与 lbKeys 一一对应；非法项记 NaN（落盘时变 null，运行时回退默认冷却）
+        provider.lbCooldowns = lbCooldownsFlag.split(",").map((s) => {
+          const n = Number(s.trim());
+          return Number.isFinite(n) && n > 0 ? n : NaN;
+        });
+      }
     }
 
     const compatJson = getFlag(flags, "compat");
@@ -2408,7 +2476,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     "  --ua <预设键|原始UA>（如 claude-code / codex / browser）",
     "  --proxy <URL|disable>（指定代理地址或明确禁用，如 http://127.0.0.1:7890 或 disable，支持 $ENV）",
     "  --auth-header",
-    "  --lb-keys \"$K1,$K2\"（多 Key 负载均衡）· --lb-cooldown 60（冷却秒数）",
+    "  --lb-keys \"$K1,$K2\"（多 Key 负载均衡）· --lb-cooldown 60（默认冷却秒数）· --lb-cooldowns \"30,120\"（按 Key 冷却秒数，与 lbKeys 对齐）",
     "  --model-api 'id:协议'（可多次，如 claude-x:anthropic-messages）",
     "  --model-base-url 'id:url'（和 --model-api 搭配混用双协议）",
     "  --compat '{...}' · --overrides '{\"modelId\":{...}}'",
