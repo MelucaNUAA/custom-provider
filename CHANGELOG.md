@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-09-02
+
+### ✨ Added
+
+- **页脚状态栏实时显示 Key 池状态**：负载均衡的冷却状态过去只能靠 `/custom-provider list` 手动查，现在常驻显示在 pi 页脚，每秒刷新
+
+```
+CLINE(S) ##@###                          6 Key 全可用，当前请求在用 #3
+CLINE(S) X#@### [==--------] 47m10s      #1 冷却中，进度条为其冷却进度
+CLINE(S) XX@### [==--------] 47m10s      挂 2 个，倒计时跟最快恢复的那个
+! CLINE(S) XXXXXX [========--] 11m59s    全池冷却，"!" 提示已无可用 Key
+```
+
+  - 名称后缀标出调度模式：`(S)` sticky / `(R)` roundrobin
+  - 点阵每字符对应一个 Key：`@` 当前请求正在使用 / `#` 可用 / `X` 冷却中；Key 超过 12 个退化为计数
+  - 进度条是最快恢复的那个 Key 的冷却进度，末尾为其精确剩余时间（`47s` / `2m03s` / `1h05m`）
+  - 只显示当前选中模型所属 provider 的池，切模型（`/model`、`Ctrl+P`、会话恢复）自动跟随
+  - 当前 provider 未配置负载均衡时不占用页脚
+
+- **429 冷却状态持久化**：冷却状态过去纯内存保存，`/clear`、`/fork` 或重启 pi 后全部丢失，导致池子误以为所有 Key 都新鲜、把仍在冷却的 Key 再撞一遍 429（对小时级冷却代价尤其大）
+  - 落盘至 `~/.pi/agent/lb-cooldowns.json`，仅在 429 时写入
+  - 磁盘上只保存 Key 的 sha256 指纹（前 12 位），不含任何明文凭证片段
+  - 重建 Key 池时按指纹恢复，已过期的冷却直接丢弃
+
+### 🔒 Security
+
+- **API Key 脱敏**：`list` / `config` / `test` 过去会完整打印明文 API Key，截图或粘贴日志时会泄漏凭证。现在统一显示为 `sk-abcd...1234`（首 7 位 + 末 4 位）
+
+### 🐛 Fixed
+
+- 429 日志的 Key 编号由 0-based 改为 1-based，与 `list` 展示的 `#1` / `#2` 对齐；同时补充冷却结束时刻
+
+---
+
 ## [0.1.12] - 2026-09-01
 
 ### ✨ Added

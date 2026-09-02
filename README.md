@@ -221,8 +221,29 @@ pi install local:/path/to/custom-provider
 - 只要还有任一 Key 未冷却就正常轮询；全部 Key 都 429 冷却时，才强行使用最早恢复的 Key 兜底
 - 某 Key 成功调用后其冷却期清零（立即恢复参与轮询），直到下次 429 再重新计冷却
 - 可按 Key 单独设置冷却：`lbCooldowns: [30, 120]`（与 lbKeys 一一对应；JSON 或添加时用 `--lb-cooldowns "30,120"`，缺失项回退 `lbCooldown`）
-- `list` 显示活跃 Key 数与模式：`3 Key（2 活跃 / 60s 冷却 / roundrobin）`
+- `list` 显示活跃 Key 数与模式：`3 Key（2 活跃 / 60s 冷却 / roundrobin）`，并逐个列出 Key 状态（API Key 已脱敏为 `sk-abcd...1234`）
 - 单 key 模式完全向后兼容（`apiKey` 字符串）
+
+#### 页脚状态栏
+
+当前 provider 的 Key 池状态常驻显示在 pi 页脚，每秒刷新：
+
+```
+CLINE(S) ##@###                          6 Key 全可用，当前请求在用 #3
+CLINE(S) X#@### [==--------] 47m10s      #1 冷却中，进度条为其冷却进度
+CLINE(S) XX@### [==--------] 47m10s      挂 2 个，倒计时跟最快恢复的那个
+! CLINE(S) XXXXXX [========--] 11m59s    全池冷却，"!" 提示已无可用 Key
+OPENROUTER(R) X#X@ [=---------] 59s      roundrobin 下冷却位置可能不相邻
+```
+
+- 名称后缀标出调度模式：`(S)` sticky / `(R)` roundrobin
+- 点阵每字符对应一个 Key：`@` 当前请求正在使用 / `#` 可用 / `X` 冷却中；Key 超过 12 个退化为计数（`4/20`）
+- 进度条是最快恢复的那个 Key 的冷却进度，末尾为其精确剩余时间
+- 只显示当前选中模型所属 provider 的池，切模型自动跟随；当前 provider 未配置负载均衡时不占用页脚
+
+#### 冷却状态持久化
+
+冷却状态落盘至 `~/.pi/agent/lb-cooldowns.json`，`/clear`、`/fork` 与重启 pi 后自动恢复，避免把仍在冷却的 Key 再撞一遍 429。文件中只保存 Key 的 sha256 指纹，不含明文凭证；已过期的冷却在重建 Key 池时直接丢弃。
 
 ### 代理配置（每个 provider 独立）
 

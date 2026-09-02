@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
+import { createHash } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import https from "https";
@@ -8,6 +9,9 @@ import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@earendi
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "custom-providers.json");
 const SPEC_CACHE_PATH = join(homedir(), ".pi", "agent", "model-specs-cache.json");
+// LB 429 冷却状态落盘路径：冷却纯内存会在 /clear、/fork、重启后丢失，
+// 导致池子误以为所有 Key 都新鲜、挨个再撞一遍 429（对小时级冷却代价很大）
+const LB_COOLDOWN_PATH = join(homedir(), ".pi", "agent", "lb-cooldowns.json");
 
 // 远程规格缓存有效期（毫秒）：24 小时
 const SPEC_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -1012,9 +1016,15 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   });
 
   // 监听 session_start 以支持热重载
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event: any, ctx: any) => {
     registerProviders();
     loadLBPools();
+    startLBStatus(ctx); // 启动页脚冷却倒计时
+  });
+
+  // 会话结束（含 /clear、/fork 触发的重建）：清理定时器与页脚残留
+  pi.on("session_shutdown", () => {
+    stopLBStatus();
   });
 
   // ================= 负载均衡（LBKeyPool）=================
@@ -1026,19 +1036,75 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   // 429 / 限流错误识别（覆盖各家上游常见文案：429、rate limit、too many requests 等）
   const RATE_LIMIT_RE = /\b429\b|rate\s*limit|too\s+many\s+requests|resource\s*exhausted|quota\s*exceeded/i;
 
+  const LB_BAR_WIDTH = 10;  // 状态栏冷却进度条格数
+  const LB_DOTS_MAX = 12;   // Key 点阵最多渲染多少个，超过退化成计数
+  // 点阵符号：全 ASCII，避免终端代码页差异导致方块或宽度错位
+  const LB_DOT_CURRENT = "@"; // 当前请求正在使用的 Key
+  const LB_DOT_READY = "#";   // 可用
+  const LB_DOT_COOLING = "X"; // 冷却中
+
+  // 毫秒拆成 时/分/秒
+  const splitDuration = (ms: number): { h: number; m: number; s: number } => ({
+    h: Math.floor(ms / 3600000),
+    m: Math.floor((ms % 3600000) / 60000),
+    s: Math.floor((ms % 60000) / 1000),
+  });
+
+  /** 完整格式 HH:MM:SS，用于 list / config / test 的详情行 */
+  const formatHMS = (ms: number): string => {
+    const { h, m, s } = splitDuration(ms);
+    return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+  };
+
+  /** 紧凑格式（47s / 2m03s / 1h05m），用于空间有限的页脚状态栏 */
+  const formatCompact = (ms: number): string => {
+    const { h, m, s } = splitDuration(ms);
+    if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
+    if (m > 0) return `${m}m${String(s).padStart(2, "0")}s`;
+    return `${s}s`;
+  };
+
+  /** Key 脱敏：list / config / test 只显示首尾，避免完整凭证被打到终端或截图里 */
+  const maskKey = (key: string): string => {
+    if (key.length <= 12) return `${key.slice(0, 2)}***`;
+    return `${key.slice(0, 7)}...${key.slice(-4)}`;
+  };
+
+  /** Key 指纹：冷却状态落盘时用它做索引，磁盘上不出现任何明文凭证片段 */
+  const keyFingerprint = (key: string): string =>
+    createHash("sha256").update(key).digest("hex").slice(0, 12);
+
+  /**
+   * 读取落盘的冷却状态：{ [provider]: { [keyFingerprint]: 冷却结束时间戳 } }。
+   * 文件损坏/不存在时返回空表 —— 冷却状态可再生，不值得因它中断启动。
+   */
+  const loadCooldownStore = (): Record<string, Record<string, number>> => {
+    try {
+      if (!existsSync(LB_COOLDOWN_PATH)) return {};
+      const parsed = JSON.parse(readFileSync(LB_COOLDOWN_PATH, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      return parsed as Record<string, Record<string, number>>;
+    } catch {
+      return {}; // 损坏就当没有，下次 429 会重新写入
+    }
+  };
+
   class LBKeyPool {
     keys: string[];           // 解析后的 key 值
     cooldownMs: number;       // 默认冷却毫秒
     cursor: number = 0;       // 轮询游标（roundrobin 用）
     cooldownEnd: number[];    // 每个 key 的冷却结束时间戳
+    cooldownStart: number[];  // 每个 key 的冷却起始时间戳（仅用于状态栏进度条）
     perKeyCooldowns: (number | null | undefined)[]; // 每 key 的冷却覆盖
     mode: "roundrobin" | "sticky"; // 调度模式
     stickyIdx: number = -1;   // sticky 模式：当前粘住的 key 索引（-1 表示未定）
+    lastUsedIdx: number = -1; // 最近一次请求实际选中的 key 索引（仅用于状态栏标记）
 
     constructor(keys: string[], defaultCooldownSec: number, perKey?: (number | null | undefined)[], mode?: "roundrobin" | "sticky") {
       this.keys = keys;
       this.cooldownMs = defaultCooldownSec * 1000;
       this.cooldownEnd = new Array(keys.length).fill(0);
+      this.cooldownStart = new Array(keys.length).fill(0);
       this.perKeyCooldowns = perKey ?? [];
       this.mode = mode ?? "roundrobin";
     }
@@ -1100,15 +1166,43 @@ export default function customProviderExtension(pi: ExtensionAPI) {
      * 触发 429：该 Key 冷却固定为配置的时长（下限 60 秒），不做指数放大/退避。
      * 冷却期内该 Key 绝不参与轮询。
      */
-    on429(idx: number): void {
+    on429(idx: number): number {
       const base = this.perKeyCooldowns[idx] ?? this.cooldownMs;
       const cooldown = Math.max(base, 60_000); // 下限 60 秒
-      this.cooldownEnd[idx] = Date.now() + cooldown;
+      const now = Date.now();
+      this.cooldownStart[idx] = now;
+      this.cooldownEnd[idx] = now + cooldown;
+      return this.cooldownEnd[idx];
     }
 
     /** 该 Key 成功调用：冷却期清零（立即恢复参与轮询），下次 429 再重新计冷却 */
     onSuccess(idx: number): void {
       this.cooldownEnd[idx] = 0;
+      this.cooldownStart[idx] = 0;
+    }
+
+    /** 从落盘状态恢复冷却（按 Key 指纹匹配，已过期的直接丢弃） */
+    restore(saved: Record<string, number> | undefined): void {
+      if (!saved) return;
+      const now = Date.now();
+      this.keys.forEach((k, i) => {
+        const end = saved[keyFingerprint(k)];
+        if (typeof end === "number" && end > now) {
+          this.cooldownEnd[i] = end;
+          // 起始时间未落盘，按默认冷却倒推，仅影响进度条观感
+          this.cooldownStart[i] = end - (this.perKeyCooldowns[i] ?? this.cooldownMs);
+        }
+      });
+    }
+
+    /** 导出仍在冷却中的 Key，供落盘（磁盘上只有指纹，没有明文 Key） */
+    snapshot(): Record<string, number> {
+      const now = Date.now();
+      const out: Record<string, number> = {};
+      this.keys.forEach((k, i) => {
+        if (this.cooldownEnd[i] > now) out[keyFingerprint(k)] = this.cooldownEnd[i];
+      });
+      return out;
     }
 
     activeCount(): number {
@@ -1124,18 +1218,56 @@ export default function customProviderExtension(pi: ExtensionAPI) {
       const now = Date.now();
       return this.keys.map((k, i) => {
         const end = this.cooldownEnd[i];
-        if (end <= now) return `      #${i + 1} ${k}：可用（未冷却）`;
-        const remainMs = end - now;
-        const remainSec = Math.ceil(remainMs / 1000);
-        const hh = String(Math.floor(remainMs / 3600000)).padStart(2, "0");
-        const mm = String(Math.floor((remainMs % 3600000) / 60000)).padStart(2, "0");
-        const ss = String(Math.floor((remainMs % 60000) / 1000)).padStart(2, "0");
+        if (end <= now) return `      #${i + 1} ${maskKey(k)}：可用（未冷却）`;
         const endTime = new Date(end);
         const hhEnd = String(endTime.getHours()).padStart(2, "0");
         const mmEnd = String(endTime.getMinutes()).padStart(2, "0");
         const ssEnd = String(endTime.getSeconds()).padStart(2, "0");
-        return `      #${i + 1} ${k}：冷却中 → ${hhEnd}:${mmEnd}:${ssEnd}（剩余 ${hh}:${mm}:${ss}）`;
+        return `      #${i + 1} ${maskKey(k)}：冷却中 -> ${hhEnd}:${mmEnd}:${ssEnd}（剩余 ${formatHMS(end - now)}）`;
       });
+    }
+
+    /**
+     * 单行池状态，供页脚状态栏常驻显示。
+     * provider 名后缀标出调度模式：'(S)' sticky / '(R)' roundrobin。
+     * 点阵每字符对应一个 Key：'@' 当前请求正在用 / '#' 可用 / 'X' 冷却中。
+     * 全部可用："CLINE(S) ##@###"
+     * 有冷却："CLINE(S) X#@### [====------] 47s"，在点阵基础上追加：
+     *   - 进度条是最快恢复的那个 Key 的冷却进度，'=' 已过去 / '-' 还剩
+     *   - 末尾是该 Key 的精确剩余时间
+     * 全部 Key 冷却时加 "!" 前缀 —— 此时轮询已无可用 Key，请求会硬撞 429。
+     */
+    poolStatus(name: string): string {
+      const now = Date.now();
+      const n = this.keys.length;
+      const cooling: number[] = [];
+      for (let i = 0; i < n; i++) {
+        if (this.cooldownEnd[i] > now) cooling.push(i);
+      }
+      const label = `${name}${this.mode === "sticky" ? "(S)" : "(R)"}`;
+
+      // Key 太多时点阵会撑爆状态栏，退化成计数
+      const dots =
+        n <= LB_DOTS_MAX
+          ? this.keys
+              .map((_, i) => {
+                if (this.cooldownEnd[i] > now) return LB_DOT_COOLING;
+                return i === this.lastUsedIdx ? LB_DOT_CURRENT : LB_DOT_READY;
+              })
+              .join("")
+          : `${n - cooling.length}/${n}`;
+      if (cooling.length === 0) return `${label} ${dots}`; // 全部可用，不显示进度条
+
+      // 最快恢复的 Key：它决定了池子多久后重新可用
+      const soonest = cooling.reduce((a, b) => (this.cooldownEnd[a] <= this.cooldownEnd[b] ? a : b));
+      const end = this.cooldownEnd[soonest];
+      const start = this.cooldownStart[soonest] || end - this.cooldownMs;
+      const elapsed = Math.min(1, Math.max(0, (now - start) / Math.max(1, end - start)));
+      const filled = Math.round(elapsed * LB_BAR_WIDTH);
+      const bar = "=".repeat(filled) + "-".repeat(LB_BAR_WIDTH - filled);
+
+      const alert = cooling.length === n ? "! " : ""; // 全池冷却，无 Key 可用
+      return `${alert}${label} ${dots} [${bar}] ${formatCompact(end - now)}`;
     }
   }
 
@@ -1152,6 +1284,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
   function loadLBPools(): void {
     lbPools.clear();
     const config = loadConfig();
+    const savedCooldowns = loadCooldownStore();
     for (const provider of config.providers) {
       if (provider.enabled === false) continue;
       // 优先从 IProvider.lbKeys 读取；兼容旧格式 compat.lb.keys
@@ -1180,13 +1313,87 @@ export default function customProviderExtension(pi: ExtensionAPI) {
               return typeof c === "number" && c > 0 ? c : null;
             })
           : undefined;
-        lbPools.set(provider.name, new LBKeyPool(keptKeys, defaultCooldown, perKey, lbMode));
+        const pool = new LBKeyPool(keptKeys, defaultCooldown, perKey, lbMode);
+        // 恢复 /clear、/fork、重启前未走完的冷却，避免刚恢复就把冷却中的 Key 再撞一遍
+        pool.restore(savedCooldowns[provider.name]);
+        lbPools.set(provider.name, pool);
       }
     }
   }
 
   // 加载 LB 池 + 注册事件（启动时执行一次）
   loadLBPools();
+
+  /**
+   * 冷却状态落盘（仅在 429 时调用，频率很低）。
+   * 落盘失败只告警不抛错：冷却状态可再生，不值得中断正在进行的请求。
+   */
+  const persistCooldowns = (): void => {
+    try {
+      const store: Record<string, Record<string, number>> = {};
+      for (const [name, pool] of lbPools) {
+        const snap = pool.snapshot();
+        if (Object.keys(snap).length > 0) store[name] = snap;
+      }
+      const dir = join(homedir(), ".pi", "agent");
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(LB_COOLDOWN_PATH, JSON.stringify(store, null, 2), "utf8");
+    } catch (error) {
+      console.warn(
+        `[custom-provider] 冷却状态落盘失败: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
+  // ================= 页脚状态栏：LB Key 池状态 =================
+  // 429 冷却是纯内存状态，此前只能靠 /custom-provider list 手动查。
+  // 这里每秒把当前 provider 的 Key 池状态刷到 pi 页脚（点阵 + 冷却倒计时）。
+
+  const LB_STATUS_ID = "custom-provider-lb";
+  let lbStatusTimer: ReturnType<typeof setInterval> | null = null;
+  let lbStatusCtx: any = null;
+  let lbStatusLast: string | undefined; // 上次写入的文本，用于跳过无变化的重绘
+  let lbCurrentProvider: string | undefined; // 当前选中模型所属 provider（= 注册时的 provider.name）
+
+  const renderLBStatus = (): void => {
+    if (!lbStatusCtx) return;
+    // 只显示当前选中模型所属 provider 的池：状态栏空间有限，
+    // 其它 provider 的冷却与当下这次对话无关，查详情用 /custom-provider list
+    const pool = lbCurrentProvider ? lbPools.get(lbCurrentProvider) : undefined;
+    const text = pool && lbCurrentProvider ? pool.poolStatus(lbCurrentProvider) : undefined;
+    if (text === lbStatusLast) return; // 内容未变，不重绘
+    lbStatusLast = text;
+    lbStatusCtx.ui.setStatus(LB_STATUS_ID, text);
+  };
+
+  // 幂等：重复调用只保留一个定时器；session_shutdown 后可再次 start
+  const stopLBStatus = (): void => {
+    if (lbStatusTimer) {
+      clearInterval(lbStatusTimer);
+      lbStatusTimer = null;
+    }
+    if (lbStatusCtx && lbStatusLast !== undefined) {
+      lbStatusCtx.ui.setStatus(LB_STATUS_ID, undefined); // 清除页脚，避免残留
+    }
+    lbStatusLast = undefined;
+    lbStatusCtx = null;
+  };
+
+  const startLBStatus = (ctx: any): void => {
+    stopLBStatus();
+    if (!ctx?.hasUI) return; // print / JSON 模式没有 TUI，不起定时器
+    lbStatusCtx = ctx;
+    lbCurrentProvider = ctx.model?.provider; // 会话恢复时的当前模型
+    lbStatusTimer = setInterval(renderLBStatus, 1000);
+    lbStatusTimer.unref?.(); // 不阻塞进程退出
+    renderLBStatus();
+  };
+
+  // 切模型（/model、Ctrl+P、会话恢复）：状态栏跟着切到新 provider 的池
+  pi.on("model_select", (event: any) => {
+    lbCurrentProvider = event.model?.provider;
+    renderLBStatus();
+  });
 
   // ================= 代理与负载均衡钩子 =================
 
@@ -1242,6 +1449,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     const picked = pool.pick() ?? pool.fallbackPick();
 
     const { key, index: keyIdx } = picked;
+    pool.lastUsedIdx = keyIdx; // 状态栏用 '*' 标出这次实际发出去的是哪个 Key
     // 替换 Authorization 为真实 key（SDK 已发送 Bearer $LB）
     event.headers["Authorization"] = `Bearer ${key}`;
     // 清除标记头（不转发给上游）
@@ -1253,6 +1461,7 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     if (modelId) {
       lbInflight.set(modelId, { poolName, keyIdx, ts: Date.now() });
     }
+    renderLBStatus(); // 立即把 '*' 挪到新选中的 Key 上
   });
 
   pi.on("after_provider_response", (event, ctx) => {
@@ -1267,10 +1476,16 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     if (!pool) return;
 
     if (event.status === 429) {
-      pool.on429(info.keyIdx);
-      console.warn(`[custom-provider] LB key #${info.keyIdx} (${info.poolName}) 上游返回 429，进入冷却`);
+      const end = pool.on429(info.keyIdx);
+      persistCooldowns();
+      renderLBStatus(); // 立即刷新页脚倒计时，不等下一个 tick
+      console.warn(
+        `[custom-provider] LB key #${info.keyIdx + 1} (${info.poolName}) 上游返回 429，` +
+        `冷却至 ${new Date(end).toLocaleTimeString()}`
+      );
     } else if (event.status >= 200 && event.status < 300) {
       pool.onSuccess(info.keyIdx);
+      renderLBStatus(); // 冷却解除也要同步清掉页脚
     }
   });
 
@@ -1296,10 +1511,12 @@ export default function customProviderExtension(pi: ExtensionAPI) {
     ) {
       const pool = lbPools.get(info.poolName);
       if (pool) {
-        pool.on429(info.keyIdx);
+        const end = pool.on429(info.keyIdx);
+        persistCooldowns();
+        renderLBStatus(); // 立即刷新页脚倒计时，不等下一个 tick
         console.warn(
-          `[custom-provider] LB key #${info.keyIdx} (${info.poolName}) 触发 429，` +
-          `进入冷却（${msg.errorMessage.slice(0, 120)}）`
+          `[custom-provider] LB key #${info.keyIdx + 1} (${info.poolName}) 触发 429，` +
+          `冷却至 ${new Date(end).toLocaleTimeString()}（${msg.errorMessage.slice(0, 120)}）`
         );
       }
     }
